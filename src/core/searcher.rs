@@ -5,7 +5,7 @@ use std::{fmt, io};
 use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
-use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
+use crate::query::{Bm25StatisticsProvider, DisjunctionStrategyConfig, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
@@ -112,6 +112,13 @@ impl Searcher {
         let executor = self.inner.index.search_executor();
         let store_reader = &self.inner.store_readers[doc_address.segment_ord as usize];
         store_reader.get_async(doc_address.doc_id, executor).await
+    }
+
+    /// Rule that selects the executor for unions of term queries in each segment.
+    ///
+    /// See [`IndexReaderBuilder::disjunction_strategy_config`](crate::IndexReaderBuilder::disjunction_strategy_config).
+    pub fn disjunction_strategy_config(&self) -> DisjunctionStrategyConfig {
+        self.inner.disjunction_strategy_config
     }
 
     /// Access the schema associated with the index of this searcher.
@@ -262,6 +269,7 @@ pub(crate) struct SearcherInner {
     segment_readers: Vec<SegmentReader>,
     store_readers: Vec<StoreReader>,
     generation: TrackedObject<SearcherGeneration>,
+    disjunction_strategy_config: DisjunctionStrategyConfig,
 }
 
 impl SearcherInner {
@@ -272,6 +280,7 @@ impl SearcherInner {
         segment_readers: Vec<SegmentReader>,
         generation: TrackedObject<SearcherGeneration>,
         doc_store_cache_num_blocks: usize,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
     ) -> io::Result<SearcherInner> {
         assert_eq!(
             &segment_readers
@@ -292,6 +301,7 @@ impl SearcherInner {
             segment_readers,
             store_readers,
             generation,
+            disjunction_strategy_config,
         })
     }
 }

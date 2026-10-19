@@ -2,12 +2,16 @@ mod block_wand_intersection;
 mod block_wand_union;
 mod boolean_query;
 mod boolean_weight;
+mod disjunction_strategy;
+mod maxscore_union;
 mod occur_weights;
 
 pub(crate) use self::block_wand_intersection::block_wand_intersection;
 pub(crate) use self::block_wand_union::{block_wand, block_wand_single_scorer};
 pub use self::boolean_query::BooleanQuery;
 pub use self::boolean_weight::BooleanWeight;
+pub use self::disjunction_strategy::{DisjunctionStrategy, DisjunctionStrategyConfig};
+pub(crate) use self::maxscore_union::maxscore;
 
 #[cfg(test)]
 mod tests {
@@ -672,6 +676,168 @@ mod tests {
             "AllScorer in both MUST and SHOULD"
         );
 
+        Ok(())
+    }
+
+    /// All live matches of `query`, scored without pruning, in top-docs order.
+    fn exhaustive_hits(
+        searcher: &crate::Searcher,
+        query: &dyn Query,
+    ) -> crate::Result<Vec<(Score, DocAddress)>> {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(searcher))?;
+        let mut hits: Vec<(Score, DocAddress)> = Vec::new();
+        for (segment_ord, reader) in searcher.segment_readers().iter().enumerate() {
+            let mut scorer = weight.scorer(reader, 1.0)?;
+            while scorer.doc() != crate::TERMINATED {
+                if !reader.is_deleted(scorer.doc()) {
+                    hits.push((
+                        scorer.score(),
+                        DocAddress::new(segment_ord as u32, scorer.doc()),
+                    ));
+                }
+                scorer.advance();
+            }
+        }
+        hits.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
+        Ok(hits)
+    }
+
+    /// Documents whose score is not within float tolerance of the lowest returned score.
+    fn clearly_above_cutoff(top_docs: &[(Score, DocAddress)]) -> Vec<DocAddress> {
+        let Some(&(cutoff, _)) = top_docs.last() else {
+            return Vec::new();
+        };
+        let mut docs: Vec<DocAddress> = top_docs
+            .iter()
+            .filter(|(score, _)| score - cutoff > 1e-4 * cutoff.abs().max(1.0))
+            .map(|&(_, doc)| doc)
+            .collect();
+        docs.sort();
+        docs
+    }
+
+    #[test]
+    fn test_disjunction_strategy_configs_match_exhaustive() -> crate::Result<()> {
+        use std::collections::HashMap;
+        use std::num::NonZeroUsize;
+
+        use crate::query::DisjunctionStrategyConfig;
+
+        const WORDS: [&str; 8] = ["w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7"];
+        let mut schema_builder = Schema::builder();
+        let text = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            // Deterministic pseudo-random documents over three segments, with deletions.
+            let mut writer: IndexWriter = index.writer_for_tests()?;
+            let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for _segment in 0..3 {
+                for _doc in 0..700 {
+                    let num_tokens = 1 + next() % 12;
+                    let body: Vec<&str> = (0..num_tokens)
+                        // Skewed word distribution: low indices are much more frequent.
+                        .map(|_| WORDS[(next() % 64).trailing_zeros().min(7) as usize])
+                        .collect();
+                    writer.add_document(doc!(text => body.join(" ")))?;
+                }
+                writer.commit()?;
+            }
+            writer.delete_term(Term::from_field_text(text, "w6"));
+            writer.commit()?;
+        }
+
+        let min_terms =
+            |n| DisjunctionStrategyConfig::max_score_from_num_terms(NonZeroUsize::new(n).unwrap());
+        let configs = [
+            DisjunctionStrategyConfig::default(),
+            min_terms(1),
+            min_terms(2),
+            min_terms(4),
+            min_terms(100),
+        ];
+        let mut queries: Vec<BooleanQuery> = [&WORDS[..2], &WORDS[1..4], &WORDS[..6], &WORDS[2..8]]
+            .iter()
+            .map(|words| {
+                BooleanQuery::new_multiterms_query(
+                    words
+                        .iter()
+                        .map(|word| Term::from_field_text(text, word))
+                        .collect(),
+                )
+            })
+            .collect();
+        // Boosted child terms keep the union specialized, with scaled score bounds.
+        for boosts in [[0.0, 1.0, 2.0, 0.5], [3.0, -1.0, 1.0, 1.0]] {
+            queries.push(BooleanQuery::new(
+                WORDS[..4]
+                    .iter()
+                    .zip(boosts)
+                    .map(|(word, boost)| {
+                        let term_query: Box<dyn Query> = Box::new(TermQuery::new(
+                            Term::from_field_text(text, word),
+                            IndexRecordOption::WithFreqs,
+                        ));
+                        let boosted: Box<dyn Query> =
+                            Box::new(crate::query::BoostQuery::new(term_query, boost));
+                        (Occur::Should, boosted)
+                    })
+                    .collect(),
+            ));
+        }
+        let block_wand_searcher = index
+            .reader_builder()
+            .disjunction_strategy_config(DisjunctionStrategyConfig::block_wand())
+            .try_into()?
+            .searcher();
+
+        let default_searcher = index.reader()?.searcher();
+        for config in configs {
+            let searcher = index
+                .reader_builder()
+                .disjunction_strategy_config(config)
+                .try_into()?
+                .searcher();
+            for query in &queries {
+                let hits = exhaustive_hits(&searcher, query)?;
+                let score_by_doc: HashMap<DocAddress, Score> =
+                    hits.iter().map(|&(score, doc)| (doc, score)).collect();
+                for (limit, offset) in [(1, 0), (10, 0), (10, 5), (100, 0), (10_000, 0)] {
+                    let expected: Vec<(Score, DocAddress)> =
+                        hits.iter().copied().skip(offset).take(limit).collect();
+                    let top_docs = TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_score();
+                    let from_reader = searcher.search(query, &top_docs)?;
+                    // Same documents as Block-Max WAND. Executors sum term scores in different
+                    // orders, so scores can differ in the last bit and swap near-equal
+                    // documents; ignore documents near the cut-off score.
+                    let from_block_wand = block_wand_searcher.search(query, &top_docs)?;
+                    assert_eq!(
+                        clearly_above_cutoff(&from_reader),
+                        clearly_above_cutoff(&from_block_wand)
+                    );
+                    let query_override = query.clone().with_disjunction_strategy_config(config);
+                    let from_query = default_searcher.search(&query_override, &top_docs)?;
+                    for actual in [from_reader, from_query] {
+                        assert_eq!(actual.len(), expected.len());
+                        for ((actual_score, actual_doc), (expected_score, _)) in
+                            actual.iter().zip(&expected)
+                        {
+                            // Equal scores may be ordered differently, so also check each
+                            // returned document against its own exhaustive score.
+                            assert_nearly_equals!(*actual_score, *expected_score);
+                            assert_nearly_equals!(*actual_score, score_by_doc[actual_doc]);
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
