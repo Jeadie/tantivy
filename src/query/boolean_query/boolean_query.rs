@@ -1,4 +1,7 @@
+use std::fmt;
+
 use super::boolean_weight::BooleanWeight;
+use super::disjunction_strategy::DisjunctionStrategyConfig;
 use crate::query::{EnableScoring, Occur, Query, SumCombiner, TermQuery, Weight};
 use crate::schema::{IndexRecordOption, Term};
 
@@ -127,10 +130,25 @@ use crate::schema::{IndexRecordOption, Term};
 ///    Ok(())
 /// }
 /// ```
-#[derive(Debug)]
 pub struct BooleanQuery {
     subqueries: Vec<(Occur, Box<dyn Query>)>,
     minimum_number_should_match: usize,
+    disjunction_strategy_config: Option<DisjunctionStrategyConfig>,
+}
+
+// Omits an unset `disjunction_strategy_config` so existing `Debug` output is unchanged.
+impl fmt::Debug for BooleanQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug_struct = f.debug_struct("BooleanQuery");
+        debug_struct.field("subqueries", &self.subqueries).field(
+            "minimum_number_should_match",
+            &self.minimum_number_should_match,
+        );
+        if let Some(disjunction_strategy_config) = &self.disjunction_strategy_config {
+            debug_struct.field("disjunction_strategy_config", disjunction_strategy_config);
+        }
+        debug_struct.finish()
+    }
 }
 
 impl Clone for BooleanQuery {
@@ -143,6 +161,7 @@ impl Clone for BooleanQuery {
         Self {
             subqueries,
             minimum_number_should_match: self.minimum_number_should_match,
+            disjunction_strategy_config: self.disjunction_strategy_config,
         }
     }
 }
@@ -160,12 +179,16 @@ impl Query for BooleanQuery {
             .iter()
             .map(|(occur, subquery)| Ok((*occur, subquery.weight(enable_scoring)?)))
             .collect::<crate::Result<_>>()?;
-        Ok(Box::new(BooleanWeight::with_minimum_number_should_match(
-            sub_weights,
-            self.minimum_number_should_match,
-            enable_scoring.is_scoring_enabled(),
-            Box::new(SumCombiner::default),
-        )))
+        let disjunction_strategy_config = self.resolve_disjunction_strategy_config(enable_scoring);
+        Ok(Box::new(
+            BooleanWeight::with_minimum_number_should_match(
+                sub_weights,
+                self.minimum_number_should_match,
+                enable_scoring.is_scoring_enabled(),
+                Box::new(SumCombiner::default),
+            )
+            .with_disjunction_strategy_config(disjunction_strategy_config),
+        ))
     }
 
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
@@ -202,6 +225,7 @@ impl BooleanQuery {
         BooleanQuery {
             subqueries,
             minimum_number_should_match,
+            disjunction_strategy_config: None,
         }
     }
 
@@ -213,6 +237,39 @@ impl BooleanQuery {
     /// Setter for `minimum_number_should_match`
     pub fn set_minimum_number_should_match(&mut self, minimum_number_should_match: usize) {
         self.minimum_number_should_match = minimum_number_should_match;
+    }
+
+    /// Sets the rule that selects the executor for unions of term queries in each segment.
+    ///
+    /// It overrides the reader's
+    /// [`IndexReaderBuilder::disjunction_strategy_config`](crate::IndexReaderBuilder::disjunction_strategy_config)
+    /// for this query only. Nested boolean queries keep their own setting.
+    #[must_use]
+    pub fn with_disjunction_strategy_config(
+        mut self,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
+    ) -> BooleanQuery {
+        self.disjunction_strategy_config = Some(disjunction_strategy_config);
+        self
+    }
+
+    /// The executor selection rule set on this query, if any.
+    pub fn disjunction_strategy_config(&self) -> Option<DisjunctionStrategyConfig> {
+        self.disjunction_strategy_config
+    }
+
+    /// The query's own config, else the searcher's, else the default.
+    fn resolve_disjunction_strategy_config(
+        &self,
+        enable_scoring: EnableScoring<'_>,
+    ) -> DisjunctionStrategyConfig {
+        self.disjunction_strategy_config
+            .or_else(|| {
+                enable_scoring
+                    .searcher()
+                    .map(|searcher| searcher.disjunction_strategy_config())
+            })
+            .unwrap_or_default()
     }
 
     /// Returns the intersection of the queries.
@@ -263,9 +320,13 @@ impl BooleanQuery {
 mod tests {
     use std::collections::HashSet;
 
+    use std::num::NonZeroUsize;
+
     use super::BooleanQuery;
     use crate::collector::{Count, DocSetCollector};
-    use crate::query::{Query, QueryClone, QueryParser, TermQuery};
+    use crate::query::{
+        DisjunctionStrategyConfig, EnableScoring, Query, QueryClone, QueryParser, TermQuery,
+    };
     use crate::schema::{Field, IndexRecordOption, Schema, TEXT};
     use crate::{DocAddress, DocId, Index, Term};
 
@@ -281,6 +342,63 @@ mod tests {
         writer.add_document(doc!(text=>"a d"))?;
         writer.commit()?;
         Ok(index)
+    }
+
+    #[test]
+    fn test_disjunction_strategy_config_resolution() -> crate::Result<()> {
+        let index = create_test_index()?;
+        let text = index.schema().get_field("text").unwrap();
+        let reader_config =
+            DisjunctionStrategyConfig::max_score_from_num_terms(NonZeroUsize::new(3).unwrap());
+        let query_config =
+            DisjunctionStrategyConfig::max_score_from_num_terms(NonZeroUsize::new(5).unwrap());
+        let query = BooleanQuery::new_multiterms_query(vec![
+            Term::from_field_text(text, "a"),
+            Term::from_field_text(text, "b"),
+        ]);
+
+        let default_searcher = index.reader()?.searcher();
+        assert_eq!(
+            default_searcher.disjunction_strategy_config(),
+            DisjunctionStrategyConfig::default()
+        );
+        let searcher = index
+            .reader_builder()
+            .disjunction_strategy_config(reader_config)
+            .try_into()?
+            .searcher();
+        assert_eq!(searcher.disjunction_strategy_config(), reader_config);
+
+        // No override: the searcher's config, or the default without a searcher.
+        assert_eq!(
+            query.resolve_disjunction_strategy_config(EnableScoring::enabled_from_searcher(
+                &searcher
+            )),
+            reader_config
+        );
+        assert_eq!(
+            query.resolve_disjunction_strategy_config(EnableScoring::disabled_from_schema(
+                searcher.schema()
+            )),
+            DisjunctionStrategyConfig::default()
+        );
+
+        // The query's override wins, and survives cloning.
+        let query = query.with_disjunction_strategy_config(query_config);
+        assert_eq!(query.disjunction_strategy_config(), Some(query_config));
+        assert_eq!(
+            query.clone().resolve_disjunction_strategy_config(
+                EnableScoring::enabled_from_searcher(&searcher)
+            ),
+            query_config
+        );
+        assert_eq!(
+            query.resolve_disjunction_strategy_config(EnableScoring::disabled_from_schema(
+                searcher.schema()
+            )),
+            query_config
+        );
+        Ok(())
     }
 
     #[test]

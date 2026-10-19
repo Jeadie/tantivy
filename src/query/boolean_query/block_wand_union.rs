@@ -328,8 +328,25 @@ mod tests {
         (left - right).abs() < 0.0001 * (left + right).abs()
     }
 
-    fn compute_checkpoints_for_each_pruning(
+    /// A pruning executor for a union of term scorers.
+    type UnionExecutor = fn(Vec<TermScorer>, Score, &mut dyn FnMut(DocId, Score) -> Score);
+
+    fn block_wand_executor(
         mut term_scorers: Vec<TermScorer>,
+        threshold: Score,
+        callback: &mut dyn FnMut(DocId, Score) -> Score,
+    ) {
+        if term_scorers.len() == 1 {
+            let scorer = term_scorers.pop().unwrap();
+            super::block_wand_single_scorer(scorer, threshold, callback);
+        } else {
+            super::block_wand(term_scorers, threshold, callback);
+        }
+    }
+
+    fn compute_checkpoints_for_each_pruning(
+        executor: UnionExecutor,
+        term_scorers: Vec<TermScorer>,
         n: usize,
     ) -> Vec<(DocId, Score)> {
         let mut heap: BinaryHeap<Float> = BinaryHeap::with_capacity(n);
@@ -350,12 +367,7 @@ mod tests {
             limit
         };
 
-        if term_scorers.len() == 1 {
-            let scorer = term_scorers.pop().unwrap();
-            super::block_wand_single_scorer(scorer, Score::MIN, callback);
-        } else {
-            super::block_wand(term_scorers, Score::MIN, callback);
-        }
+        executor(term_scorers, Score::MIN, callback);
         checkpoints
     }
 
@@ -425,6 +437,24 @@ mod tests {
     }
 
     fn test_block_wand_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
+        test_union_executor_aux(block_wand_executor, posting_lists, fieldnorms);
+    }
+
+    fn test_maxscore_aux(posting_lists: &[Vec<(DocId, u32)>], fieldnorms: &[u32]) {
+        test_union_executor_aux(
+            crate::query::boolean_query::maxscore,
+            posting_lists,
+            fieldnorms,
+        );
+    }
+
+    /// Checks that `executor` passes the same competitive documents to the collector as an
+    /// exhaustive union.
+    fn test_union_executor_aux(
+        executor: UnionExecutor,
+        posting_lists: &[Vec<(DocId, u32)>],
+        fieldnorms: &[u32],
+    ) {
         // We virtually repeat all docs 64 times in order to emulate blocks of 2 documents
         // and surface blogs more easily.
         const REPEAT: usize = 64;
@@ -473,7 +503,7 @@ mod tests {
             .collect();
         for top_k in 1..4 {
             let checkpoints_for_each_pruning =
-                compute_checkpoints_for_each_pruning(term_scorers.clone(), top_k);
+                compute_checkpoints_for_each_pruning(executor, term_scorers.clone(), top_k);
             let checkpoints_manual =
                 compute_checkpoints_manual(term_scorers.clone(), top_k, max_doc as u32);
             assert_eq!(checkpoints_for_each_pruning.len(), checkpoints_manual.len());
@@ -606,6 +636,7 @@ mod tests {
             502, 507, 669, 680, 76, 594, 626, 578, 331, 170, 639, 665, 186,
         ][..];
         test_block_wand_aux(postings_lists, fieldnorms);
+        test_maxscore_aux(postings_lists, fieldnorms);
     }
 
     proptest! {
@@ -615,6 +646,32 @@ mod tests {
         #[ignore]
         fn test_block_wand_three_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(3)) {
             test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn test_maxscore_single_term_scorer((posting_lists, fieldnorms) in gen_term_scorers(1)) {
+            test_maxscore_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+
+        #[test]
+        fn test_maxscore_two_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(2)) {
+            test_maxscore_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+        #[test]
+        fn test_maxscore_three_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(3)) {
+            test_maxscore_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+
+        #[test]
+        fn test_maxscore_five_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(5)) {
+            test_maxscore_aux(&posting_lists[..], &fieldnorms[..]);
         }
     }
 }

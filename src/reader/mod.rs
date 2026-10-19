@@ -9,6 +9,7 @@ pub use warming::Warmer;
 use self::warming::WarmingState;
 use crate::core::searcher::{SearcherGeneration, SearcherInner};
 use crate::directory::{Directory, WatchCallback, WatchHandle, META_LOCK};
+use crate::query::DisjunctionStrategyConfig;
 use crate::store::DOCSTORE_CACHE_CAPACITY;
 use crate::{Index, Inventory, Searcher, SegmentReader, TrackedObject};
 
@@ -47,6 +48,7 @@ pub enum ReloadPolicy {
 /// - [`Warmer`] implementations
 /// - number of warming threads, for parallelizing warming work
 /// - The cache size of the underlying doc store readers.
+/// - [`DisjunctionStrategyConfig`] used by the [`Searcher`]s of the reader.
 #[derive(Clone)]
 pub struct IndexReaderBuilder {
     reload_policy: ReloadPolicy,
@@ -54,6 +56,7 @@ pub struct IndexReaderBuilder {
     warmers: Vec<Weak<dyn Warmer>>,
     num_warming_threads: usize,
     doc_store_cache_num_blocks: usize,
+    disjunction_strategy_config: DisjunctionStrategyConfig,
 }
 
 impl IndexReaderBuilder {
@@ -65,6 +68,7 @@ impl IndexReaderBuilder {
             warmers: Vec::new(),
             num_warming_threads: 1,
             doc_store_cache_num_blocks: DOCSTORE_CACHE_CAPACITY,
+            disjunction_strategy_config: DisjunctionStrategyConfig::default(),
         }
     }
 
@@ -82,6 +86,7 @@ impl IndexReaderBuilder {
         )?;
         let inner_reader = InnerIndexReader::new(
             self.doc_store_cache_num_blocks,
+            self.disjunction_strategy_config,
             self.index,
             warming_state,
             searcher_generation_inventory,
@@ -133,6 +138,20 @@ impl IndexReaderBuilder {
         self
     }
 
+    /// Sets the rule that selects the executor for unions of term queries in each segment.
+    ///
+    /// It applies to every query searched with this reader's [`Searcher`]s, unless a
+    /// [`BooleanQuery`](crate::query::BooleanQuery) sets its own with
+    /// [`BooleanQuery::with_disjunction_strategy_config`](crate::query::BooleanQuery::with_disjunction_strategy_config).
+    #[must_use]
+    pub fn disjunction_strategy_config(
+        mut self,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
+    ) -> IndexReaderBuilder {
+        self.disjunction_strategy_config = disjunction_strategy_config;
+        self
+    }
+
     /// Set the [`Warmer`]s that are invoked when reloading searchable segments.
     #[must_use]
     pub fn warmers(mut self, warmers: Vec<Weak<dyn Warmer>>) -> IndexReaderBuilder {
@@ -161,6 +180,7 @@ impl TryInto<IndexReader> for IndexReaderBuilder {
 
 struct InnerIndexReader {
     doc_store_cache_num_blocks: usize,
+    disjunction_strategy_config: DisjunctionStrategyConfig,
     index: Index,
     warming_state: WarmingState,
     searcher: arc_swap::ArcSwap<SearcherInner>,
@@ -171,6 +191,7 @@ struct InnerIndexReader {
 impl InnerIndexReader {
     fn new(
         doc_store_cache_num_blocks: usize,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
         index: Index,
         warming_state: WarmingState,
         // The searcher_generation_inventory is not used as source, but as target to track the
@@ -182,12 +203,14 @@ impl InnerIndexReader {
         let searcher = Self::create_searcher(
             &index,
             doc_store_cache_num_blocks,
+            disjunction_strategy_config,
             &warming_state,
             &searcher_generation_counter,
             &searcher_generation_inventory,
         )?;
         Ok(InnerIndexReader {
             doc_store_cache_num_blocks,
+            disjunction_strategy_config,
             index,
             warming_state,
             searcher: ArcSwap::from(searcher),
@@ -224,6 +247,7 @@ impl InnerIndexReader {
     fn create_searcher(
         index: &Index,
         doc_store_cache_num_blocks: usize,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
         warming_state: &WarmingState,
         searcher_generation_counter: &Arc<AtomicU64>,
         searcher_generation_inventory: &Inventory<SearcherGeneration>,
@@ -242,6 +266,7 @@ impl InnerIndexReader {
             segment_readers,
             searcher_generation,
             doc_store_cache_num_blocks,
+            disjunction_strategy_config,
         )?);
 
         warming_state.warm_new_searcher_generation(&searcher.clone().into())?;
@@ -252,6 +277,7 @@ impl InnerIndexReader {
         let searcher = Self::create_searcher(
             &self.index,
             self.doc_store_cache_num_blocks,
+            self.disjunction_strategy_config,
             &self.warming_state,
             &self.searcher_generation_counter,
             &self.searcher_generation_inventory,

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 
+use super::disjunction_strategy::{DisjunctionStrategy, DisjunctionStrategyConfig};
 use super::occur_weights::OccurWeights;
 use crate::docset::{SeekDangerResult, COLLECT_BLOCK_BUFFER_LEN};
 use crate::index::SegmentReader;
@@ -13,7 +14,7 @@ use crate::query::{
     intersect_scorers, AllScorer, BufferedUnionScorer, EmptyScorer, Exclude, Explanation, Occur,
     RequiredOptionalScorer, Scorer, Weight,
 };
-use crate::{DocId, Score, TERMINATED};
+use crate::{DocId, DocSet, Score, TERMINATED};
 
 enum SpecializedScorer {
     TermUnion(Vec<TermScorer>),
@@ -258,6 +259,7 @@ pub struct BooleanWeight<TScoreCombiner: ScoreCombiner> {
     minimum_number_should_match: usize,
     scoring_enabled: bool,
     score_combiner_fn: Box<dyn Fn() -> TScoreCombiner + Sync + Send>,
+    disjunction_strategy_config: DisjunctionStrategyConfig,
 }
 
 impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
@@ -285,6 +287,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     minimum_number_should_match,
                     scoring_enabled,
                     score_combiner_fn,
+                    disjunction_strategy_config: DisjunctionStrategyConfig::default(),
                 }
             }
             Ordering::Equal => {
@@ -295,6 +298,7 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     minimum_number_should_match: 0,
                     scoring_enabled,
                     score_combiner_fn,
+                    disjunction_strategy_config: DisjunctionStrategyConfig::default(),
                 }
             }
             Ordering::Less => {
@@ -305,9 +309,20 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
                     minimum_number_should_match: 0,
                     scoring_enabled,
                     score_combiner_fn,
+                    disjunction_strategy_config: DisjunctionStrategyConfig::default(),
                 }
             }
         }
+    }
+
+    /// Sets the rule that selects the executor for unions of term queries in each segment.
+    #[must_use]
+    pub fn with_disjunction_strategy_config(
+        mut self,
+        disjunction_strategy_config: DisjunctionStrategyConfig,
+    ) -> Self {
+        self.disjunction_strategy_config = disjunction_strategy_config;
+        self
     }
 
     fn complex_scorer<TComplexScoreCombiner: ScoreCombiner>(
@@ -688,7 +703,18 @@ impl<TScoreCombiner: ScoreCombiner + Sync> Weight for BooleanWeight<TScoreCombin
             // every matching term and falls back to the plain union.
             SpecializedScorer::TermUnion(term_scorers) => {
                 if TScoreCombiner::SUPPORTS_BLOCK_WAND {
-                    super::block_wand(term_scorers, threshold, callback);
+                    let num_terms = term_scorers
+                        .iter()
+                        .filter(|scorer| scorer.doc() != TERMINATED)
+                        .count();
+                    match self.disjunction_strategy_config.select(num_terms) {
+                        DisjunctionStrategy::BlockWand => {
+                            super::block_wand(term_scorers, threshold, callback);
+                        }
+                        DisjunctionStrategy::MaxScore => {
+                            super::maxscore(term_scorers, threshold, callback);
+                        }
+                    }
                 } else {
                     let mut union_scorer =
                         BufferedUnionScorer::build(term_scorers, &self.score_combiner_fn, num_docs);
