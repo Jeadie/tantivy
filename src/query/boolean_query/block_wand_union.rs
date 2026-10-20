@@ -315,28 +315,23 @@ impl<'a> From<&'a mut TermScorer> for TermScorerCursor<'a> {
 impl TermScorerCursor<'_> {
     fn seek(&mut self, target: DocId) -> DocId {
         self.doc = self.scorer.seek(target);
-        self.forget_block_if_passed();
         self.doc
     }
 
     fn advance(&mut self) -> DocId {
         self.doc = self.scorer.advance();
-        self.forget_block_if_passed();
         self.doc
     }
 
-    /// The skip reader only moves to a later block when `seek` or `advance` goes past the last
-    /// doc of its current block. If the new doc is still within that block, the skip reader
-    /// did not move and `block` is still valid.
-    fn forget_block_if_passed(&mut self) {
-        if self.block.is_some_and(|block| self.doc > block.last_doc) {
-            self.block = None;
-        }
-    }
-
-    /// Same as `scorer.seek_block(target)` followed by `scorer.block_max_score()`. While
-    /// `target` is in the block of the previous call, the result comes from `block`.
+    /// Same as `scorer.seek_block(target)` followed by `scorer.block_max_score()`, for a
+    /// `target` that is not before the current doc. While `target` is in the block of the
+    /// previous call, the result comes from `block`.
+    ///
+    /// Why `block` is still valid then: the skip reader only moves when `seek` or `advance`
+    /// goes past the last doc of its block, and docs never decrease. So if it moved, the
+    /// current doc, and therefore `target`, would be after `block.last_doc`.
     fn block_max_score(&mut self, target: DocId) -> Score {
+        debug_assert!(self.doc <= target);
         if let Some(block) = self.block {
             if target <= block.last_doc {
                 debug_assert_eq!(self.scorer.last_doc_in_block(), block.last_doc);
