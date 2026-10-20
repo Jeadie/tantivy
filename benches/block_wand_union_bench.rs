@@ -185,7 +185,7 @@ fn open_or_build_index() -> (Searcher, Field) {
         Some(dir) => {
             let dir = Path::new(&dir);
             // `meta.json` is written by the commit, so its presence means a complete index.
-            if dir.join("meta.json").exists() {
+            if dir.join("meta.json").try_exists().unwrap() {
                 Index::open_in_dir(dir).unwrap()
             } else {
                 std::fs::create_dir_all(dir).unwrap();
