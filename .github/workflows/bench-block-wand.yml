@@ -148,6 +148,11 @@ jobs:
           {
             echo "segments=$SHARD_SEGMENTS"
             echo "shard=$SHARD_FILTER"
+            echo "num_docs=$NUM_DOCS"
+            echo "min_samples=$MIN_SAMPLES"
+            echo "budget_secs=$BUDGET_SECS"
+            echo "repetitions=$REPETITIONS"
+            cat dist/refs.txt
             echo "cpu=$(lscpu | sed -n 's/^Model name: *//p') x $(nproc)"
             echo "load_before=$(cut -d' ' -f1-3 /proc/loadavg)"
           } > "results/$shard.meta"
