@@ -6,7 +6,7 @@
 // - P99 and P99.9 latency per cell. binggan only reports min/median/average/max, so this bench
 //   collects its own samples.
 //
-// Corpus model (1M docs, single segment, seeded RNG):
+// Corpus model (seeded RNG; 1M docs in one segment by default):
 // - 20 terms in each of four classes: rare (0.1% of docs), medium (3%), dense (25%), and
 //   correlated (50% of the 5% "topic" docs, 0.5% of the others).
 // - Term frequencies follow a geometric-like distribution; filler tokens vary field lengths.
@@ -20,6 +20,11 @@
 // - BLOCK_WAND_BENCH_INDEX_DIR: build the index in this directory once, then reuse it. Without
 //   it, the index is built in RAM on every run.
 // - BLOCK_WAND_BENCH_BUDGET_SECS: time budget per cell after the minimum sample count (default 3).
+// - BLOCK_WAND_BENCH_NUM_DOCS: number of documents (default 1,000,000).
+// - BLOCK_WAND_BENCH_SEGMENTS: number of segments, with equal document counts (default 1). Each
+//   segment collects its own top K from a threshold of zero, as in production searches.
+// - BLOCK_WAND_BENCH_MIN_SAMPLES / BLOCK_WAND_BENCH_MAX_SAMPLES: samples per cell (default 1,000
+//   and 10,000). P99 needs at least 1,000 samples to have 10 samples above it.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -29,22 +34,66 @@ use rand::prelude::*;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tantivy::collector::TopDocs;
+use tantivy::indexer::NoMergePolicy;
 use tantivy::query::BooleanQuery;
 use tantivy::schema::{Field, Schema, TEXT};
 use tantivy::{doc, Index, ReloadPolicy, Searcher, Term};
 
-const NUM_DOCS: usize = 1_000_000;
+const DEFAULT_NUM_DOCS: usize = 1_000_000;
 const TERMS_PER_CLASS: usize = 20;
 const NUM_TERMS: [usize; 5] = [2, 3, 5, 10, 20];
 const TOP_K: [usize; 3] = [10, 100, 1000];
 
 /// P99 needs at least 10 samples above it.
-const MIN_SAMPLES: usize = 1_000;
+const DEFAULT_MIN_SAMPLES: usize = 1_000;
 /// P99.9 needs at least 10 samples above it.
 const P999_MIN_SAMPLES: usize = 10_000;
-const MAX_SAMPLES: usize = 10_000;
+const DEFAULT_MAX_SAMPLES: usize = 10_000;
 const DEFAULT_CELL_BUDGET_SECS: f64 = 3.0;
 const WARMUP_RUNS: usize = 20;
+
+/// Settings read from the environment.
+struct BenchConfig {
+    filter: String,
+    cell_budget: Duration,
+    num_docs: usize,
+    num_segments: usize,
+    min_samples: usize,
+    max_samples: usize,
+}
+
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} has an invalid value: {value:?}")),
+        Err(_) => default,
+    }
+}
+
+impl BenchConfig {
+    fn from_env() -> Self {
+        let config = BenchConfig {
+            filter: env_or("BLOCK_WAND_BENCH_FILTER", String::new()),
+            cell_budget: Duration::from_secs_f64(env_or(
+                "BLOCK_WAND_BENCH_BUDGET_SECS",
+                DEFAULT_CELL_BUDGET_SECS,
+            )),
+            num_docs: env_or("BLOCK_WAND_BENCH_NUM_DOCS", DEFAULT_NUM_DOCS),
+            num_segments: env_or("BLOCK_WAND_BENCH_SEGMENTS", 1),
+            min_samples: env_or("BLOCK_WAND_BENCH_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
+            max_samples: env_or("BLOCK_WAND_BENCH_MAX_SAMPLES", DEFAULT_MAX_SAMPLES),
+        };
+        assert!(config.num_segments >= 1 && config.num_segments <= config.num_docs);
+        assert!(config.min_samples >= 1 && config.min_samples <= config.max_samples);
+        config
+    }
+
+    /// Identifies the corpus, so that an index directory is only reused for the same corpus.
+    fn corpus_id(&self) -> String {
+        format!("docs={} segments={}", self.num_docs, self.num_segments)
+    }
+}
 
 #[derive(Clone, Copy)]
 enum TermClass {
@@ -140,15 +189,20 @@ fn random_term_freq(rng: &mut StdRng) -> u32 {
     tf
 }
 
-fn fill_index(index: &Index, body: Field) {
+fn fill_index(index: &Index, body: Field, config: &BenchConfig) {
     let mut rng = StdRng::from_seed([7u8; 32]);
     let tokens: Vec<Vec<String>> = TermClass::ALL
         .iter()
         .map(|class| (0..TERMS_PER_CLASS).map(|ord| class.token(ord)).collect())
         .collect();
     let mut writer = index.writer_with_num_threads(1, 2_000_000_000).unwrap();
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let docs_per_segment = config.num_docs.div_ceil(config.num_segments);
     let mut text = String::new();
-    for _ in 0..NUM_DOCS {
+    for doc_ord in 0..config.num_docs {
+        if doc_ord > 0 && doc_ord % docs_per_segment == 0 {
+            commit_one_segment(index, &mut writer);
+        }
         text.clear();
         let is_topic_doc = rng.random_bool(0.05);
         for (class, class_tokens) in TermClass::ALL.iter().zip(&tokens) {
@@ -173,30 +227,56 @@ fn fill_index(index: &Index, body: Field) {
         }
         writer.add_document(doc!(body => text.as_str())).unwrap();
     }
-    writer.commit().unwrap();
+    commit_one_segment(index, &mut writer);
     writer.wait_merging_threads().unwrap();
 }
 
-fn open_or_build_index() -> (Searcher, Field) {
+/// Commits the pending documents as exactly one new segment. The writer can flush a large commit
+/// into several segments when its memory budget is full, so those segments are merged.
+fn commit_one_segment(index: &Index, writer: &mut tantivy::IndexWriter) {
+    let before = index.searchable_segment_ids().unwrap();
+    writer.commit().unwrap();
+    let new_segments: Vec<_> = index
+        .searchable_segment_ids()
+        .unwrap()
+        .into_iter()
+        .filter(|segment_id| !before.contains(segment_id))
+        .collect();
+    if new_segments.len() > 1 {
+        writer.merge(&new_segments).wait().unwrap();
+    }
+}
+
+fn open_or_build_index(config: &BenchConfig) -> (Searcher, Field) {
     let mut schema_builder = Schema::builder();
     let body = schema_builder.add_text_field("body", TEXT);
     let schema = schema_builder.build();
     let index = match std::env::var_os("BLOCK_WAND_BENCH_INDEX_DIR") {
         Some(dir) => {
             let dir = Path::new(&dir);
-            // `meta.json` is written by the commit, so its presence means a complete index.
-            if dir.join("meta.json").try_exists().unwrap() {
+            // The corpus file is written after the last commit, so its presence means a complete
+            // index.
+            let corpus_file = dir.join("bench_corpus.txt");
+            if corpus_file.try_exists().unwrap() {
+                let corpus_id = std::fs::read_to_string(&corpus_file).unwrap();
+                assert_eq!(
+                    corpus_id,
+                    config.corpus_id(),
+                    "{} holds an index for another corpus",
+                    dir.display()
+                );
                 Index::open_in_dir(dir).unwrap()
             } else {
                 std::fs::create_dir_all(dir).unwrap();
                 let index = Index::create_in_dir(dir, schema).unwrap();
-                fill_index(&index, body);
+                fill_index(&index, body, config);
+                std::fs::write(&corpus_file, config.corpus_id()).unwrap();
                 index
             }
         }
         None => {
             let index = Index::create_in_ram(schema);
-            fill_index(&index, body);
+            fill_index(&index, body, config);
             index
         }
     };
@@ -206,7 +286,9 @@ fn open_or_build_index() -> (Searcher, Field) {
         .reload_policy(ReloadPolicy::Manual)
         .try_into()
         .unwrap();
-    (reader.searcher(), body)
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), config.num_segments);
+    (searcher, body)
 }
 
 fn percentile(sorted_samples: &[Duration], quantile: f64) -> Duration {
@@ -235,15 +317,9 @@ fn checksum(hits: &[(f32, tantivy::DocAddress)]) -> u64 {
 }
 
 fn main() {
-    let filter = std::env::var("BLOCK_WAND_BENCH_FILTER").unwrap_or_default();
-    let cell_budget = Duration::from_secs_f64(
-        std::env::var("BLOCK_WAND_BENCH_BUDGET_SECS")
-            .ok()
-            .map(|secs| secs.parse().unwrap())
-            .unwrap_or(DEFAULT_CELL_BUDGET_SECS),
-    );
+    let config = BenchConfig::from_env();
     let build_start = Instant::now();
-    let (searcher, body) = open_or_build_index();
+    let (searcher, body) = open_or_build_index(&config);
     eprintln!(
         "index ready: {} docs, {} segment(s) in {:.1}s",
         searcher.num_docs(),
@@ -257,7 +333,7 @@ fn main() {
         eprintln!(
             "{:>7} terms: doc_freq ~ {doc_freq} ({:.2}%)",
             class.prefix(),
-            100.0 * doc_freq as f64 / NUM_DOCS as f64
+            100.0 * doc_freq as f64 / config.num_docs as f64
         );
     }
 
@@ -275,17 +351,18 @@ fn main() {
             let query = BooleanQuery::new_multiterms_query(terms);
             for k in TOP_K {
                 let label = format!("{}/{num_terms}/{k}", mix.name());
-                if !label.contains(&filter) {
+                if !label.contains(&config.filter) {
                     continue;
                 }
                 let result_checksum = checksum(&search(&searcher, &query, k));
                 for _ in 0..WARMUP_RUNS {
                     std::hint::black_box(search(&searcher, &query, k));
                 }
-                let mut samples: Vec<Duration> = Vec::with_capacity(MAX_SAMPLES);
+                let mut samples: Vec<Duration> = Vec::with_capacity(config.max_samples);
                 let cell_start = Instant::now();
-                while samples.len() < MAX_SAMPLES
-                    && (samples.len() < MIN_SAMPLES || cell_start.elapsed() < cell_budget)
+                while samples.len() < config.max_samples
+                    && (samples.len() < config.min_samples
+                        || cell_start.elapsed() < config.cell_budget)
                 {
                     let start = Instant::now();
                     std::hint::black_box(search(&searcher, &query, k));
