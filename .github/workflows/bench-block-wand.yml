@@ -2,6 +2,7 @@ name: Block-Max WAND bench
 
 # Compares the P99 latency of `benches/block_wand_union_bench.rs` between a baseline ref and a head
 # ref. Both binaries run on the same runner, in alternating order, for each shard of the matrix.
+# The results are in the run summary and in the `summary` artifact.
 #
 # Triggers:
 # - Add the `run-bench` label to a pull request: compares the PR head with its base, with the
@@ -173,9 +174,6 @@ jobs:
     needs: [build, bench]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - name: Check out head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -203,12 +201,6 @@ jobs:
           python3 .github/bench/summarize_block_wand_bench.py results --header "$header" --output summary.md || status=$?
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "status=$status" >> "$GITHUB_OUTPUT"
-      - name: Comment on the pull request
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file summary.md
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: summary
