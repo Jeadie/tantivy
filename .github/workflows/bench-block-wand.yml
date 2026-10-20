@@ -40,8 +40,8 @@ on:
         description: Time per cell and run after the minimum sample count
         default: "10"
       repetitions:
-        description: Runs of each binary per cell, in alternating order (2 = A B B A)
-        default: "2"
+        description: Runs of each binary per cell, in alternating order (3 = A B, B A, A B)
+        default: "3"
 
 permissions:
   contents: read
@@ -62,7 +62,7 @@ env:
   TERMS: ${{ inputs.terms || '[2, 3, 5, 10, 20]' }}
   MIN_SAMPLES: ${{ inputs.min_samples || '1000' }}
   BUDGET_SECS: ${{ inputs.budget_secs || '10' }}
-  REPETITIONS: ${{ inputs.repetitions || '2' }}
+  REPETITIONS: ${{ inputs.repetitions || '3' }}
 
 jobs:
   build:
@@ -163,7 +163,7 @@ jobs:
             for side in $order; do
               BLOCK_WAND_BENCH_FILTER="$SHARD_FILTER" "dist/$side" \
                 | awk -v seg="$SHARD_SEGMENTS" -v side="$side" -v rep="$rep" \
-                    'NR > 1 { print seg "\t" side "\t" rep "\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 }' \
+                    'NR > 1 { printf "%s\t%s\t%s", seg, side, rep; for (i = 1; i <= NF; i++) printf "\t%s", $i; print "" }' \
                 | tee -a "results/$shard.tsv"
             done
           done

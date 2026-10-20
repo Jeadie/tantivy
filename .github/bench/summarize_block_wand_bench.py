@@ -15,12 +15,31 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# P99 needs at least 10 samples above it.
-MIN_SAMPLES_FOR_P99 = 1_000
+
+@dataclass(frozen=True)
+class Percentile:
+    name: str
+    # A percentile needs at least 10 samples above it.
+    min_samples: int
+
+
+PERCENTILES = [
+    Percentile("P90", 100),
+    Percentile("P95", 200),
+    Percentile("P99", 1_000),
+    Percentile("P99.9", 10_000),
+]
+# The verdict uses P99.
+VERDICT_PERCENTILE = PERCENTILES[2]
+MIN_SAMPLES_FOR_P99 = VERDICT_PERCENTILE.min_samples
 # Repetitions of the same binary that differ by more than this are too noisy to compare.
 MAX_REPETITION_SPREAD = 0.20
-# A verdict needs at least this many runs of each binary.
+# A verdict needs at least this many runs of each binary. With 2 runs each and no real difference,
+# all runs of one binary beat all runs of the other by chance for 1 cell in 3 (1 in 10 with 3
+# runs), so the workflow uses 3 runs by default and MIN_CHANGE also applies.
 MIN_REPETITIONS = 2
+# A verdict also needs a median P99 change of at least this size.
+MIN_CHANGE = 0.05
 
 
 @dataclass(frozen=True)
@@ -32,14 +51,60 @@ class Measurement:
     terms: int
     k: int
     samples: int
-    p99_us: float
-    p999_us: float
-    p999_ok: bool
+    # Latency in µs for each percentile name. Results from older versions of the bench only
+    # have P99 and P99.9.
+    latencies_us: dict[str, float]
     checksum: str
 
     @property
     def cell(self) -> tuple[str, int, int]:
         return (self.mix, self.terms, self.k)
+
+    @property
+    def p99_us(self) -> float:
+        return self.latencies_us["P99"]
+
+    def has(self, percentile: Percentile) -> bool:
+        return percentile.name in self.latencies_us and self.samples >= percentile.min_samples
+
+
+def percentile_change(
+    reference: list[Measurement], other: list[Measurement], percentile: Percentile
+) -> float | None:
+    """Median `other` / median `reference` - 1, or None if a run lacks valid data."""
+    runs = reference + other
+    if not reference or not other or not all(m.has(percentile) for m in runs):
+        return None
+    ref = statistics.median(m.latencies_us[percentile.name] for m in reference)
+    oth = statistics.median(m.latencies_us[percentile.name] for m in other)
+    return oth / ref - 1.0
+
+
+def fmt_change(change: float | None) -> str:
+    return "-" if change is None else f"{change:+.1%}"
+
+
+def verdict(reference: list[Measurement], other: list[Measurement]) -> str:
+    """Verdict on the P99 of `other` against `reference`."""
+    if not reference or not other:
+        return "missing"
+    if min(len(reference), len(other)) < MIN_REPETITIONS:
+        return f"fewer than {MIN_REPETITIONS} runs"
+    if min(m.samples for m in reference + other) < MIN_SAMPLES_FOR_P99:
+        return f"too few samples (<{MIN_SAMPLES_FOR_P99})"
+    if spread(reference) > MAX_REPETITION_SPREAD or spread(other) > MAX_REPETITION_SPREAD:
+        return "noisy"
+    ref = [m.p99_us for m in reference]
+    oth = [m.p99_us for m in other]
+    change = statistics.median(oth) / statistics.median(ref) - 1.0
+    if max(oth) < min(ref) and change <= -MIN_CHANGE:
+        return "faster"
+    if min(oth) > max(ref) and change >= MIN_CHANGE:
+        return "slower"
+    return "no clear change"
+
+
+CLEAR_VERDICTS = ("faster", "slower", "no clear change")
 
 
 @dataclass
@@ -64,30 +129,13 @@ class Cell:
     def min_samples(self) -> int:
         return min(m.samples for m in self.base + self.head)
 
-    def change(self) -> float:
-        """Median head P99 / median baseline P99 - 1."""
-        base = statistics.median(m.p99_us for m in self.base)
-        head = statistics.median(m.p99_us for m in self.head)
-        return head / base - 1.0
+    def change(self, percentile: Percentile = VERDICT_PERCENTILE) -> float | None:
+        return percentile_change(self.base, self.head, percentile)
 
     def verdict(self) -> str:
         if self.results_differ:
             return "**RESULTS DIFFER**"
-        if not self.base or not self.head:
-            return "missing"
-        if min(len(self.base), len(self.head)) < MIN_REPETITIONS:
-            return f"fewer than {MIN_REPETITIONS} runs"
-        if self.min_samples < MIN_SAMPLES_FOR_P99:
-            return f"too few samples (<{MIN_SAMPLES_FOR_P99})"
-        if spread(self.base) > MAX_REPETITION_SPREAD or spread(self.head) > MAX_REPETITION_SPREAD:
-            return "noisy"
-        base = [m.p99_us for m in self.base]
-        head = [m.p99_us for m in self.head]
-        if max(head) < min(base):
-            return "faster"
-        if min(head) > max(base):
-            return "slower"
-        return "no clear change"
+        return verdict(self.base, self.head)
 
 
 @dataclass(frozen=True)
@@ -109,29 +157,36 @@ def spread(measurements: list[Measurement]) -> float:
     return max(values) / min(values) - 1.0 if len(values) > 1 else 0.0
 
 
+def parse_measurement(parts: list[str]) -> Measurement | None:
+    if len(parts) == 12:
+        seg, binary, rep, mix, terms, k, samples, p90, p95, p99, p999, checksum = parts
+        latencies = {"P90": p90, "P95": p95, "P99": p99, "P99.9": p999}
+    elif len(parts) == 11:
+        # Older bench output: P99, P99.9 and a P99.9 validity flag.
+        seg, binary, rep, mix, terms, k, samples, p99, p999, _p999_ok, checksum = parts
+        latencies = {"P99": p99, "P99.9": p999}
+    else:
+        return None
+    return Measurement(
+        segments=int(seg),
+        binary=binary,
+        repetition=int(rep),
+        mix=mix,
+        terms=int(terms),
+        k=int(k),
+        samples=int(samples),
+        latencies_us={name: float(value) for name, value in latencies.items()},
+        checksum=checksum,
+    )
+
+
 def read_measurements(results_dir: Path) -> list[Measurement]:
     measurements = []
     for path in sorted(results_dir.glob("*.tsv")):
         for line in path.read_text().splitlines():
-            parts = line.split("\t")
-            if len(parts) != 11:
-                continue
-            seg, binary, rep, mix, terms, k, samples, p99, p999, p999_ok, checksum = parts
-            measurements.append(
-                Measurement(
-                    segments=int(seg),
-                    binary=binary,
-                    repetition=int(rep),
-                    mix=mix,
-                    terms=int(terms),
-                    k=int(k),
-                    samples=int(samples),
-                    p99_us=float(p99),
-                    p999_us=float(p999),
-                    p999_ok=p999_ok == "true",
-                    checksum=checksum,
-                )
-            )
+            measurement = parse_measurement(line.split("\t"))
+            if measurement is not None:
+                measurements.append(measurement)
     return measurements
 
 
@@ -178,6 +233,18 @@ def fmt_reps(measurements: list[Measurement]) -> str:
     return " / ".join(fmt_us(m.p99_us) for m in ordered)
 
 
+def geomean_changes(changes: list[float]) -> float:
+    return math.exp(statistics.fmean(math.log(1 + change) for change in changes)) - 1
+
+
+def percentile_rules() -> str:
+    names = ", ".join(f"{p.name} needs {p.min_samples:,}" for p in PERCENTILES)
+    return (
+        f"A percentile change is shown only when every run has enough samples ({names}). "
+        "Changes are median head / median baseline - 1, over the runs of each binary."
+    )
+
+
 def report(by_segments: dict[int, list[Cell]], metas: list[JobMeta], header: str) -> str:
     lines = [header, ""]
     cpus = sorted({meta.cpu for meta in metas})
@@ -186,35 +253,38 @@ def report(by_segments: dict[int, list[Cell]], metas: list[JobMeta], header: str
     lines.append("can have different absolute times.")
     lines.append("")
     lines.append(
-        f"Verdict: **faster** / **slower** only when every repetition of one binary beats every "
-        f"repetition of the other, each binary's repetitions agree within "
-        f"{MAX_REPETITION_SPREAD:.0%}, each binary has at least {MIN_REPETITIONS} runs, and each "
-        f"run has at least {MIN_SAMPLES_FOR_P99} samples."
+        f"Verdict (on P99): **faster** / **slower** only when every run of one binary beats every "
+        f"run of the other, the median changes by at least {MIN_CHANGE:.0%}, each binary's runs "
+        f"agree within {MAX_REPETITION_SPREAD:.0%}, each binary has at least {MIN_REPETITIONS} "
+        f"runs, and each run has at least {MIN_SAMPLES_FOR_P99:,} samples. {percentile_rules()}"
     )
     for segments, cells in by_segments.items():
-        verdicts = defaultdict(int)
+        verdicts: dict[str, int] = defaultdict(int)
         for cell in cells:
             verdicts[cell.verdict()] += 1
-        clear = [c for c in cells if c.verdict() in ("faster", "slower", "no clear change")]
+        clear = [c for c in cells if c.verdict() in CLEAR_VERDICTS]
         lines += ["", f"### {segments} segment(s)", ""]
         summary = ", ".join(f"{name}: {count}" for name, count in sorted(verdicts.items()))
         lines.append(f"{len(cells)} cells. {summary}.")
-        if clear:
-            geomean = math.exp(statistics.fmean(math.log(1 + c.change()) for c in clear)) - 1
-            lines.append(
-                f"Geometric mean of the P99 change over the {len(clear)} cells that are not "
-                f"noisy: {geomean:+.1%}."
-            )
+        for percentile in PERCENTILES:
+            changes = [c.change(percentile) for c in clear]
+            valid = [change for change in changes if change is not None]
+            if valid:
+                lines.append(
+                    f"- {percentile.name}: geometric mean change {geomean_changes(valid):+.1%} "
+                    f"over {len(valid)} cells that are not noisy."
+                )
+        names = " | ".join(p.name for p in PERCENTILES)
         lines += [
             "",
-            "| Cell | Min samples | Baseline P99 | Head P99 | Change | Verdict |",
-            "| --- | ---: | ---: | ---: | ---: | --- |",
+            f"| Cell | Min samples | Baseline P99 | Head P99 | {names} | Verdict |",
+            "| --- | ---: | ---: | ---: | " + " | ".join("---:" for _ in PERCENTILES) + " | --- |",
         ]
         for cell in cells:
-            change = f"{cell.change():+.1%}" if cell.base and cell.head else "-"
+            changes = " | ".join(fmt_change(cell.change(p)) for p in PERCENTILES)
             lines.append(
                 f"| {cell.label} | {cell.min_samples} | {fmt_reps(cell.base)} | "
-                f"{fmt_reps(cell.head)} | {change} | {cell.verdict()} |"
+                f"{fmt_reps(cell.head)} | {changes} | {cell.verdict()} |"
             )
     return "\n".join(lines) + "\n"
 
