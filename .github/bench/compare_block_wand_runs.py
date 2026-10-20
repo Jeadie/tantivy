@@ -19,7 +19,6 @@ Exit codes: 0 on success, 2 if the runs used different corpus settings.
 from __future__ import annotations
 
 import argparse
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -30,15 +29,17 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from summarize_block_wand_bench import (  # noqa: E402
-    MAX_REPETITION_SPREAD,
-    MIN_REPETITIONS,
-    MIN_SAMPLES_FOR_P99,
+    PERCENTILES,
     JobMeta,
+    Percentile,
     Measurement,
+    fmt_change,
     fmt_us,
+    percentile_change,
+    percentile_rules,
     read_measurements,
     read_metas,
-    spread,
+    verdict,
 )
 
 
@@ -77,29 +78,19 @@ class CellComparison:
     def label(self) -> str:
         return f"{self.mix}/{self.terms}/{self.k}"
 
-    def change(self) -> float:
-        a = statistics.median(m.p99_us for m in self.a)
-        b = statistics.median(m.p99_us for m in self.b)
-        return b / a - 1.0
+    @property
+    def same_cpu(self) -> bool:
+        return self.cpu_a == self.cpu_b
+
+    def change(self, percentile: Percentile) -> float | None:
+        return percentile_change(self.a, self.b, percentile) if self.same_cpu else None
 
     def verdict(self) -> str:
         if not self.a or not self.b:
             return "missing in one run"
-        if self.cpu_a != self.cpu_b:
+        if not self.same_cpu:
             return "different CPU, not compared"
-        if min(len(self.a), len(self.b)) < MIN_REPETITIONS:
-            return f"fewer than {MIN_REPETITIONS} runs"
-        if min(m.samples for m in self.a + self.b) < MIN_SAMPLES_FOR_P99:
-            return f"too few samples (<{MIN_SAMPLES_FOR_P99})"
-        if spread(self.a) > MAX_REPETITION_SPREAD or spread(self.b) > MAX_REPETITION_SPREAD:
-            return "noisy"
-        a = [m.p99_us for m in self.a]
-        b = [m.p99_us for m in self.b]
-        if max(b) < min(a):
-            return "faster"
-        if min(b) > max(a):
-            return "slower"
-        return "no clear change"
+        return verdict(self.a, self.b)
 
     def results_differ(self) -> bool:
         return len({m.checksum for m in self.a + self.b}) > 1
@@ -155,8 +146,9 @@ def report(run_a: RunResults, run_b: RunResults, side: str, comparisons: list[Ce
         "## Block-Max WAND bench: comparison of two runs",
         "",
         f"Side: `{side}`. Run A: {run_a.label} ({shas(run_a)}). Run B: {run_b.label} ({shas(run_b)}).",
-        "Change = median P99 of run B / median P99 of run A - 1. Cells measured on different CPU",
-        "models are not compared. Verdicts use the same rules as the summary of one run.",
+        "Change = median of run B / median of run A - 1, for each percentile. Cells measured on",
+        "different CPU models are not compared. The verdict (on P99) uses the same rules as the",
+        f"summary of one run. {percentile_rules()}",
     ]
     for segments in sorted({c.segments for c in comparisons}):
         cells = [c for c in comparisons if c.segments == segments]
@@ -165,18 +157,20 @@ def report(run_a: RunResults, run_b: RunResults, side: str, comparisons: list[Ce
             counts[cell.verdict()] = counts.get(cell.verdict(), 0) + 1
         lines += ["", f"### {segments} segment(s)", ""]
         lines.append(", ".join(f"{name}: {count}" for name, count in sorted(counts.items())) + ".")
+        names = " | ".join(p.name for p in PERCENTILES)
         lines += [
             "",
-            "| Cell | Run A P99 | Run B P99 | Change | Verdict | Same results |",
-            "| --- | ---: | ---: | ---: | --- | --- |",
+            f"| Cell | Run A P99 | Run B P99 | {names} | Verdict | Same results |",
+            "| --- | ---: | ---: | " + " | ".join("---:" for _ in PERCENTILES) + " | --- | --- |",
         ]
         for cell in cells:
             a = " / ".join(fmt_us(m.p99_us) for m in sorted(cell.a, key=lambda m: m.repetition))
             b = " / ".join(fmt_us(m.p99_us) for m in sorted(cell.b, key=lambda m: m.repetition))
-            comparable = cell.a and cell.b and cell.cpu_a == cell.cpu_b
-            change = f"{cell.change():+.1%}" if comparable else "-"
+            changes = " | ".join(fmt_change(cell.change(p)) for p in PERCENTILES)
             same = "-" if not (cell.a and cell.b) else ("no" if cell.results_differ() else "yes")
-            lines.append(f"| {cell.label} | {a or '-'} | {b or '-'} | {change} | {cell.verdict()} | {same} |")
+            lines.append(
+                f"| {cell.label} | {a or '-'} | {b or '-'} | {changes} | {cell.verdict()} | {same} |"
+            )
     return "\n".join(lines) + "\n"
 
 

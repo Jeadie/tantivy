@@ -24,7 +24,7 @@
 // - BLOCK_WAND_BENCH_SEGMENTS: number of segments, with equal document counts (default 1). Each
 //   segment collects its own top K from a threshold of zero, as in production searches.
 // - BLOCK_WAND_BENCH_MIN_SAMPLES / BLOCK_WAND_BENCH_MAX_SAMPLES: samples per cell (default 1,000
-//   and 10,000). P99 needs at least 1,000 samples to have 10 samples above it.
+//   and 10,000). P99 needs at least 1,000 samples to have 10 samples above it, P99.9 needs 10,000.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -47,8 +47,15 @@ const TOP_K: [usize; 3] = [10, 100, 1000];
 /// P99 needs at least 10 samples above it.
 const DEFAULT_MIN_SAMPLES: usize = 1_000;
 /// P99.9 needs at least 10 samples above it.
-const P999_MIN_SAMPLES: usize = 10_000;
 const DEFAULT_MAX_SAMPLES: usize = 10_000;
+/// Percentiles printed for each cell. A percentile q needs at least 10 / (1 - q) samples to have
+/// 10 samples above it: 100 for P90, 200 for P95, 1,000 for P99 and 10,000 for P99.9.
+const PERCENTILES: [(&str, f64); 4] = [
+    ("p90_us", 0.90),
+    ("p95_us", 0.95),
+    ("p99_us", 0.99),
+    ("p999_us", 0.999),
+];
 const DEFAULT_CELL_BUDGET_SECS: f64 = 3.0;
 const WARMUP_RUNS: usize = 20;
 
@@ -337,9 +344,18 @@ fn main() {
         );
     }
 
+    let percentile_names: Vec<String> = PERCENTILES
+        .iter()
+        .map(|(name, _)| format!("{name:>12}"))
+        .collect();
     println!(
-        "{:<11} {:>5} {:>5} {:>8} {:>12} {:>12} {:>9} {:>16}",
-        "mix", "terms", "k", "samples", "p99_us", "p999_us", "p999_ok", "checksum"
+        "{:<11} {:>5} {:>5} {:>8} {} {:>16}",
+        "mix",
+        "terms",
+        "k",
+        "samples",
+        percentile_names.join(" "),
+        "checksum"
     );
     for mix in QueryMix::ALL {
         for num_terms in NUM_TERMS {
@@ -369,15 +385,19 @@ fn main() {
                     samples.push(start.elapsed());
                 }
                 samples.sort();
+                let percentile_values: Vec<String> = PERCENTILES
+                    .iter()
+                    .map(|&(_, quantile)| {
+                        format!("{:>12.1}", micros(percentile(&samples, quantile)))
+                    })
+                    .collect();
                 println!(
-                    "{:<11} {:>5} {:>5} {:>8} {:>12.1} {:>12.1} {:>9} {:>16x}",
+                    "{:<11} {:>5} {:>5} {:>8} {} {:>16x}",
                     mix.name(),
                     num_terms,
                     k,
                     samples.len(),
-                    micros(percentile(&samples, 0.99)),
-                    micros(percentile(&samples, 0.999)),
-                    samples.len() >= P999_MIN_SAMPLES,
+                    percentile_values.join(" "),
                     result_checksum,
                 );
                 eprintln!("done {label} in {:.1}s", cell_start.elapsed().as_secs_f64());
