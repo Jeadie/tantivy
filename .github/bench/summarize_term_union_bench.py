@@ -29,8 +29,9 @@ PERCENTILES = [
     Percentile("P99", 1_000),
     Percentile("P99.9", 10_000),
 ]
-# The verdict uses P99.
+# The verdict uses P99, confirmed by P95.
 VERDICT_PERCENTILE = PERCENTILES[2]
+CONFIRM_PERCENTILE = PERCENTILES[1]
 MIN_SAMPLES_FOR_P99 = VERDICT_PERCENTILE.min_samples
 # Repetitions of the same binary that differ by more than this are too noisy to compare.
 MAX_REPETITION_SPREAD = 0.20
@@ -84,8 +85,28 @@ def fmt_change(change: float | None) -> str:
     return "-" if change is None else f"{change:+.1%}"
 
 
+def separation(reference: list[Measurement], other: list[Measurement], name: str) -> int:
+    """-1 if every run of `other` is below every run of `reference` at this percentile, +1 if
+    every run is above, 0 otherwise (or if a run lacks the percentile)."""
+    if not all(name in m.latencies_us for m in reference + other):
+        return 0
+    ref = [m.latencies_us[name] for m in reference]
+    oth = [m.latencies_us[name] for m in other]
+    if max(oth) < min(ref):
+        return -1
+    if min(oth) > max(ref):
+        return 1
+    return 0
+
+
 def verdict(reference: list[Measurement], other: list[Measurement]) -> str:
-    """Verdict on the P99 of `other` against `reference`."""
+    """Verdict on the P99 of `other` against `reference`.
+
+    "faster" / "slower" also need every run to be separated in the same direction at P95. In a
+    run that compared `main` with itself (10M documents, 171 cells), 3 cells passed the P99 rule
+    by chance, and none of them passed at P95. A P99 change that P95 does not confirm is reported
+    as "... at P99 only", because it can be a real change of the tail only, or noise.
+    """
     if not reference or not other:
         return "missing"
     if min(len(reference), len(other)) < MIN_REPETITIONS:
@@ -94,17 +115,25 @@ def verdict(reference: list[Measurement], other: list[Measurement]) -> str:
         return f"too few samples (<{MIN_SAMPLES_FOR_P99})"
     if spread(reference) > MAX_REPETITION_SPREAD or spread(other) > MAX_REPETITION_SPREAD:
         return "noisy"
-    ref = [m.p99_us for m in reference]
-    oth = [m.p99_us for m in other]
-    change = statistics.median(oth) / statistics.median(ref) - 1.0
-    if max(oth) < min(ref) and change <= -MIN_CHANGE:
-        return "faster"
-    if min(oth) > max(ref) and change >= MIN_CHANGE:
-        return "slower"
-    return "no clear change"
+    change = statistics.median(m.p99_us for m in other) / statistics.median(
+        m.p99_us for m in reference
+    ) - 1.0
+    direction = separation(reference, other, VERDICT_PERCENTILE.name)
+    if direction == 0 or abs(change) < MIN_CHANGE or (change < 0) != (direction < 0):
+        return "no clear change"
+    word = "faster" if direction < 0 else "slower"
+    if separation(reference, other, CONFIRM_PERCENTILE.name) == direction:
+        return word
+    return f"{word} at P99 only"
 
 
-CLEAR_VERDICTS = ("faster", "slower", "no clear change")
+CLEAR_VERDICTS = (
+    "faster",
+    "slower",
+    "faster at P99 only",
+    "slower at P99 only",
+    "no clear change",
+)
 
 
 @dataclass
@@ -254,9 +283,12 @@ def report(by_segments: dict[int, list[Cell]], metas: list[JobMeta], header: str
     lines.append("")
     lines.append(
         f"Verdict (on P99): **faster** / **slower** only when every run of one binary beats every "
-        f"run of the other, the median changes by at least {MIN_CHANGE:.0%}, each binary's runs "
+        f"run of the other at P99 and at {CONFIRM_PERCENTILE.name}, the median P99 changes by at "
+        f"least {MIN_CHANGE:.0%}, each binary's runs "
         f"agree within {MAX_REPETITION_SPREAD:.0%}, each binary has at least {MIN_REPETITIONS} "
-        f"runs, and each run has at least {MIN_SAMPLES_FOR_P99:,} samples. {percentile_rules()}"
+        f"runs, and each run has at least {MIN_SAMPLES_FOR_P99:,} samples. A P99 change that "
+        f"{CONFIRM_PERCENTILE.name} does not confirm is reported as \"faster/slower at P99 only\". "
+        f"{percentile_rules()}"
     )
     for segments, cells in by_segments.items():
         verdicts: dict[str, int] = defaultdict(int)
