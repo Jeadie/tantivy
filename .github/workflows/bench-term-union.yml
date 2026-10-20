@@ -46,9 +46,10 @@ on:
 permissions:
   contents: read
 
-# Keyed on the label, so that adding an unrelated label does not cancel a running bench.
+# A new `run-bench` label on a pull request cancels the bench that is running for that pull request.
+# Manual runs never cancel each other, and an unrelated label does not cancel a running bench.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'manual' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || format('pr-{0}-{1}', github.event.pull_request.number, github.event.label.name) }}
   cancel-in-progress: true
 
 env:
