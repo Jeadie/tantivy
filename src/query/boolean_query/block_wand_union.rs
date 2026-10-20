@@ -682,6 +682,52 @@ mod tests {
         test_block_wand_aux(postings_lists, fieldnorms);
     }
 
+    // The score of a doc is summed in the order of the scorers. Reordering the scorers after a
+    // pivot must give the order of a stable sort, so that scores do not change in the last bits.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn test_advance_all_scorers_on_pivot_keeps_stable_sort_order(
+            next_docs_on_pivot in proptest::collection::vec(1u32..5, 1..6),
+            mut docs_after_pivot in proptest::collection::vec(1u32..5, 0..6),
+        ) {
+            const MAX_DOC: usize = 8;
+            let fieldnorms = vec![1u32; MAX_DOC];
+            let bm25_weight = Bm25Weight::for_one_term(2, MAX_DOC as u64, 1.0);
+            docs_after_pivot.sort();
+            // The scorers on the pivot (doc 0) come first, then the others, sorted by doc.
+            let mut term_scorers: Vec<TermScorer> = next_docs_on_pivot
+                .iter()
+                .map(|&next_doc| {
+                    TermScorer::create_for_test(&[(0, 1), (next_doc, 1)], &fieldnorms, bm25_weight.clone())
+                })
+                .chain(docs_after_pivot.iter().map(|&doc| {
+                    TermScorer::create_for_test(&[(doc, 1)], &fieldnorms, bm25_weight.clone())
+                }))
+                .collect();
+            let mut cursors: Vec<super::TermScorerCursor> = term_scorers
+                .iter_mut()
+                .map(super::TermScorerCursor::from)
+                .collect();
+            let identity = |cursor: &super::TermScorerCursor| &*cursor.scorer as *const TermScorer;
+            let mut expected: Vec<(DocId, *const TermScorer)> = next_docs_on_pivot
+                .iter()
+                .chain(docs_after_pivot.iter())
+                .copied()
+                .zip(cursors.iter().map(identity))
+                .collect();
+            expected.sort_by_key(|&(doc, _)| doc);
+
+            super::advance_all_scorers_on_pivot(&mut cursors, next_docs_on_pivot.len());
+
+            let actual: Vec<(DocId, *const TermScorer)> = cursors
+                .iter()
+                .map(|cursor| (cursor.doc, identity(cursor)))
+                .collect();
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
     // More than two scorers exercise the reordering after a pivot, where several scorers can
     // move at once and land between other scorers.
     proptest! {
