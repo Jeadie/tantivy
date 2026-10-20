@@ -7,8 +7,8 @@
 //   collects its own samples.
 //
 // Corpus model (seeded RNG; 1M docs in one segment by default):
-// - 20 terms in each of four classes: rare (0.1% of docs), medium (3%), dense (25%), and
-//   correlated (50% of the 5% "topic" docs, 0.5% of the others).
+// - 20 terms in each of four classes: rare (0.1% of docs), medium (3%), dense (25%), and correlated
+//   (50% of the 5% "topic" docs, 0.5% of the others).
 // - Term frequencies follow a geometric-like distribution; filler tokens vary field lengths.
 //
 // Each cell also prints a checksum of the top-K (doc address, score bits), so that two builds
@@ -17,8 +17,8 @@
 // Run with: cargo bench --bench block_wand_union_bench
 // Environment variables:
 // - BLOCK_WAND_BENCH_FILTER: only run cells whose label (`mix/terms/k`) contains this substring.
-// - BLOCK_WAND_BENCH_INDEX_DIR: build the index in this directory once, then reuse it. Without
-//   it, the index is built in RAM on every run.
+// - BLOCK_WAND_BENCH_INDEX_DIR: build the index in this directory once, then reuse it. Without it,
+//   the index is built in RAM on every run.
 // - BLOCK_WAND_BENCH_BUDGET_SECS: time budget per cell after the minimum sample count (default 3).
 // - BLOCK_WAND_BENCH_NUM_DOCS: number of documents (default 1,000,000).
 // - BLOCK_WAND_BENCH_SEGMENTS: number of segments, with equal document counts (default 1). Each
