@@ -26,6 +26,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+# Do not write __pycache__ next to the scripts when importing the summary module.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from summarize_block_wand_bench import (  # noqa: E402
     MAX_REPETITION_SPREAD,
