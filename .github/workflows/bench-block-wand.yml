@@ -1,0 +1,215 @@
+name: Block-Max WAND bench
+
+# Compares the P99 latency of `benches/block_wand_union_bench.rs` between a baseline ref and a head
+# ref. Both binaries run on the same runner, in alternating order, for each shard of the matrix.
+# The results are in the run summary and in the `summary` artifact.
+#
+# Triggers:
+# - Add the `run-bench` label to a pull request: compares the PR head with its base, with the
+#   default settings below.
+# - Run the workflow manually (Actions tab, or `gh workflow run`) to set the corpus size, the
+#   segment counts and the sample counts. Manual runs need this file on the default branch.
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline git ref
+        default: main
+      head_ref:
+        description: Git ref to compare with the baseline (empty = the ref of this run)
+        default: ""
+      num_docs:
+        description: Number of documents in the corpus
+        default: "1000000"
+      segments:
+        description: JSON list of segment counts. Each one is a separate index.
+        default: "[1, 8]"
+      mixes:
+        description: JSON list of query mixes
+        default: '["rare", "medium", "dense", "skewed", "mixed", "correlated"]'
+      terms:
+        description: JSON list of term counts
+        default: "[2, 3, 5, 10, 20]"
+      min_samples:
+        description: Minimum samples per cell and run. P99 needs at least 1000.
+        default: "1000"
+      budget_secs:
+        description: Time per cell and run after the minimum sample count
+        default: "10"
+      repetitions:
+        description: Runs of each binary per cell, in alternating order (2 = A B B A)
+        default: "2"
+
+permissions:
+  contents: read
+
+# Keyed on the label, so that adding an unrelated label does not cancel a running bench.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'manual' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCH: block_wand_union_bench
+  BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}
+  HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_ref || github.sha }}
+  NUM_DOCS: ${{ inputs.num_docs || '1000000' }}
+  SEGMENTS: ${{ inputs.segments || '[1, 8]' }}
+  MIXES: ${{ inputs.mixes || '["rare", "medium", "dense", "skewed", "mixed", "correlated"]' }}
+  TERMS: ${{ inputs.terms || '[2, 3, 5, 10, 20]' }}
+  MIN_SAMPLES: ${{ inputs.min_samples || '1000' }}
+  BUDGET_SECS: ${{ inputs.budget_secs || '10' }}
+  REPETITIONS: ${{ inputs.repetitions || '2' }}
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-bench'
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REF }}
+          path: head
+          persist-credentials: false
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+      - name: Use the head bench in the baseline
+        # The baseline must be measured by the same bench code. It can predate the bench.
+        run: |
+          cp "head/benches/$BENCH.rs" "base/benches/$BENCH.rs"
+          if ! grep -q "name = \"$BENCH\"" base/Cargo.toml; then
+            printf '\n[[bench]]\nname = "%s"\nharness = false\n' "$BENCH" >> base/Cargo.toml
+          fi
+      - name: Install stable
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          toolchain: stable
+          profile: minimal
+      - name: Build bench binaries
+        run: |
+          mkdir dist
+          for side in base head; do
+            exe=$(cd "$side" && cargo bench --bench "$BENCH" --no-run --message-format=json \
+              | jq -r 'select(.executable != null) | .executable')
+            cp "$exe" "dist/$side"
+            strip "dist/$side"
+            echo "$side=$(git -C "$side" rev-parse HEAD)" >> dist/refs.txt
+          done
+          cat dist/refs.txt
+      - name: Compute the bench matrix
+        id: matrix
+        run: |
+          matrix=$(jq -cn --argjson segments "$SEGMENTS" --argjson mixes "$MIXES" --argjson terms "$TERMS" \
+            '{include: [$segments[] as $s | $mixes[] as $m | $terms[] as $t | {segments: $s, filter: "\($m)/\($t)/"}]}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "$matrix" | jq '.include | length' | xargs echo "jobs:"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-binaries
+          path: dist/
+          retention-days: 7
+
+  bench:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}
+    name: bench (${{ matrix.segments }} seg, ${{ matrix.filter }})
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-binaries
+          path: dist
+      - name: Run baseline and head in alternating order
+        env:
+          SHARD_SEGMENTS: ${{ matrix.segments }}
+          SHARD_FILTER: ${{ matrix.filter }}
+        run: |
+          chmod +x dist/base dist/head
+          shard=$(echo "$SHARD_SEGMENTS-$SHARD_FILTER" | tr '/' '_')
+          mkdir results
+          export BLOCK_WAND_BENCH_NUM_DOCS="$NUM_DOCS"
+          export BLOCK_WAND_BENCH_SEGMENTS="$SHARD_SEGMENTS"
+          export BLOCK_WAND_BENCH_MIN_SAMPLES="$MIN_SAMPLES"
+          export BLOCK_WAND_BENCH_BUDGET_SECS="$BUDGET_SECS"
+          export BLOCK_WAND_BENCH_INDEX_DIR="$RUNNER_TEMP/index"
+          {
+            echo "segments=$SHARD_SEGMENTS"
+            echo "shard=$SHARD_FILTER"
+            echo "cpu=$(lscpu | sed -n 's/^Model name: *//p') x $(nproc)"
+            echo "load_before=$(cut -d' ' -f1-3 /proc/loadavg)"
+          } > "results/$shard.meta"
+          # Build the index once. Both binaries open the same index.
+          BLOCK_WAND_BENCH_FILTER=no-cell dist/base
+          for rep in $(seq 1 "$REPETITIONS"); do
+            if [ $((rep % 2)) -eq 1 ]; then order="base head"; else order="head base"; fi
+            for side in $order; do
+              BLOCK_WAND_BENCH_FILTER="$SHARD_FILTER" "dist/$side" \
+                | awk -v seg="$SHARD_SEGMENTS" -v side="$side" -v rep="$rep" \
+                    'NR > 1 { print seg "\t" side "\t" rep "\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6 "\t" $7 "\t" $8 }' \
+                | tee -a "results/$shard.tsv"
+            done
+          done
+          echo "load_after=$(cut -d' ' -f1-3 /proc/loadavg)" >> "results/$shard.meta"
+          echo "shard=$shard" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: results-${{ env.shard }}
+          path: results/
+          retention-days: 30
+
+  summary:
+    needs: [build, bench]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REF }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-*
+          path: results
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-binaries
+          path: dist
+      - name: Summarize
+        id: summarize
+        run: |
+          base=$(sed -n 's/^base=//p' dist/refs.txt)
+          head=$(sed -n 's/^head=//p' dist/refs.txt)
+          header="## Block-Max WAND bench
+
+          Baseline \`${base:0:8}\`, head \`${head:0:8}\`. ${NUM_DOCS} documents, ${MIN_SAMPLES} minimum samples, ${REPETITIONS} runs of each binary per cell. [Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          status=0
+          python3 .github/bench/summarize_block_wand_bench.py results --header "$header" --output summary.md || status=$?
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: summary
+          path: |
+            summary.md
+            results/
+          retention-days: 30
+      - name: Fail if the results differ
+        if: steps.summarize.outputs.status != '0'
+        run: |
+          echo "::error::The baseline and the head returned different top-K results. See the summary."
+          exit 1
