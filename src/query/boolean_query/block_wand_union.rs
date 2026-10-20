@@ -639,6 +639,16 @@ mod tests {
         test_block_wand_aux(postings_lists, fieldnorms);
     }
 
+    // More than two scorers exercise the reordering after a pivot, where several scorers can
+    // move at once and land between other scorers.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+        #[test]
+        fn test_block_wand_five_term_scorers((posting_lists, fieldnorms) in gen_term_scorers(5)) {
+            test_block_wand_aux(&posting_lists[..], &fieldnorms[..]);
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(500))]
         #[ignore]
