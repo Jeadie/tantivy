@@ -97,6 +97,11 @@ class JobMeta:
     cpu: str
     load_before: str
     load_after: str
+    # Settings and commits of the run. Empty in results from older versions of the workflow.
+    num_docs: str = ""
+    min_samples: str = ""
+    base_sha: str = ""
+    head_sha: str = ""
 
 
 def spread(measurements: list[Measurement]) -> float:
@@ -143,6 +148,10 @@ def read_metas(results_dir: Path) -> list[JobMeta]:
                 cpu=values.get("cpu", "?"),
                 load_before=values.get("load_before", "?"),
                 load_after=values.get("load_after", "?"),
+                num_docs=values.get("num_docs", ""),
+                min_samples=values.get("min_samples", ""),
+                base_sha=values.get("base", ""),
+                head_sha=values.get("head", ""),
             )
         )
     return metas
