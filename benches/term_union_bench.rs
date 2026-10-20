@@ -1,4 +1,4 @@
-// Latency of the Block-Max WAND executor for top-K unions of term queries.
+// Latency of top-K unions of term queries. These run on the Block-Max WAND executor.
 //
 // What's measured:
 // - `a OR b OR ...` term unions (`BooleanQuery::new_multiterms_query`), top-K by BM25 score.
@@ -14,16 +14,16 @@
 // Each cell also prints a checksum of the top-K (doc address, score bits), so that two builds
 // can be checked for identical results.
 //
-// Run with: cargo bench --bench block_wand_union_bench
+// Run with: cargo bench --bench term_union_bench
 // Environment variables:
-// - BLOCK_WAND_BENCH_FILTER: only run cells whose label (`mix/terms/k`) contains this substring.
-// - BLOCK_WAND_BENCH_INDEX_DIR: build the index in this directory once, then reuse it. Without it,
+// - TERM_UNION_BENCH_FILTER: only run cells whose label (`mix/terms/k`) contains this substring.
+// - TERM_UNION_BENCH_INDEX_DIR: build the index in this directory once, then reuse it. Without it,
 //   the index is built in RAM on every run.
-// - BLOCK_WAND_BENCH_BUDGET_SECS: time budget per cell after the minimum sample count (default 3).
-// - BLOCK_WAND_BENCH_NUM_DOCS: number of documents (default 1,000,000).
-// - BLOCK_WAND_BENCH_SEGMENTS: number of segments, with equal document counts (default 1). Each
+// - TERM_UNION_BENCH_BUDGET_SECS: time budget per cell after the minimum sample count (default 3).
+// - TERM_UNION_BENCH_NUM_DOCS: number of documents (default 1,000,000).
+// - TERM_UNION_BENCH_SEGMENTS: number of segments, with equal document counts (default 1). Each
 //   segment collects its own top K from a threshold of zero, as in production searches.
-// - BLOCK_WAND_BENCH_MIN_SAMPLES / BLOCK_WAND_BENCH_MAX_SAMPLES: samples per cell (default 1,000
+// - TERM_UNION_BENCH_MIN_SAMPLES / TERM_UNION_BENCH_MAX_SAMPLES: samples per cell (default 1,000
 //   and 10,000). P99 needs at least 1,000 samples to have 10 samples above it, P99.9 needs 10,000.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -81,15 +81,15 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 impl BenchConfig {
     fn from_env() -> Self {
         let config = BenchConfig {
-            filter: env_or("BLOCK_WAND_BENCH_FILTER", String::new()),
+            filter: env_or("TERM_UNION_BENCH_FILTER", String::new()),
             cell_budget: Duration::from_secs_f64(env_or(
-                "BLOCK_WAND_BENCH_BUDGET_SECS",
+                "TERM_UNION_BENCH_BUDGET_SECS",
                 DEFAULT_CELL_BUDGET_SECS,
             )),
-            num_docs: env_or("BLOCK_WAND_BENCH_NUM_DOCS", DEFAULT_NUM_DOCS),
-            num_segments: env_or("BLOCK_WAND_BENCH_SEGMENTS", 1),
-            min_samples: env_or("BLOCK_WAND_BENCH_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
-            max_samples: env_or("BLOCK_WAND_BENCH_MAX_SAMPLES", DEFAULT_MAX_SAMPLES),
+            num_docs: env_or("TERM_UNION_BENCH_NUM_DOCS", DEFAULT_NUM_DOCS),
+            num_segments: env_or("TERM_UNION_BENCH_SEGMENTS", 1),
+            min_samples: env_or("TERM_UNION_BENCH_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
+            max_samples: env_or("TERM_UNION_BENCH_MAX_SAMPLES", DEFAULT_MAX_SAMPLES),
         };
         assert!(config.num_segments >= 1 && config.num_segments <= config.num_docs);
         assert!(config.min_samples >= 1 && config.min_samples <= config.max_samples);
@@ -258,7 +258,7 @@ fn open_or_build_index(config: &BenchConfig) -> (Searcher, Field) {
     let mut schema_builder = Schema::builder();
     let body = schema_builder.add_text_field("body", TEXT);
     let schema = schema_builder.build();
-    let index = match std::env::var_os("BLOCK_WAND_BENCH_INDEX_DIR") {
+    let index = match std::env::var_os("TERM_UNION_BENCH_INDEX_DIR") {
         Some(dir) => {
             let dir = Path::new(&dir);
             // The corpus file is written after the last commit, so its presence means a complete

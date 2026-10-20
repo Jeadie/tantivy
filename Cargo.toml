@@ -247,5 +247,5 @@ name = "intersection_bench"
 harness = false
 
 [[bench]]
-name = "block_wand_union_bench"
+name = "term_union_bench"
 harness = false

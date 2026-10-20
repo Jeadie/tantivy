@@ -1,6 +1,6 @@
-name: Block-Max WAND bench
+name: Term union bench
 
-# Compares the P99 latency of `benches/block_wand_union_bench.rs` between a baseline ref and a head
+# Compares the P90 to P99.9 latency of `benches/term_union_bench.rs` between a baseline ref and a head
 # ref. Both binaries run on the same runner, in alternating order, for each shard of the matrix.
 # The results are in the run summary and in the `summary` artifact.
 #
@@ -53,7 +53,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  BENCH: block_wand_union_bench
+  BENCH: term_union_bench
   BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}
   HEAD_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_ref || github.sha }}
   NUM_DOCS: ${{ inputs.num_docs || '1000000' }}
@@ -140,11 +140,11 @@ jobs:
           chmod +x dist/base dist/head
           shard=$(echo "$SHARD_SEGMENTS-$SHARD_FILTER" | tr '/' '_')
           mkdir results
-          export BLOCK_WAND_BENCH_NUM_DOCS="$NUM_DOCS"
-          export BLOCK_WAND_BENCH_SEGMENTS="$SHARD_SEGMENTS"
-          export BLOCK_WAND_BENCH_MIN_SAMPLES="$MIN_SAMPLES"
-          export BLOCK_WAND_BENCH_BUDGET_SECS="$BUDGET_SECS"
-          export BLOCK_WAND_BENCH_INDEX_DIR="$RUNNER_TEMP/index"
+          export TERM_UNION_BENCH_NUM_DOCS="$NUM_DOCS"
+          export TERM_UNION_BENCH_SEGMENTS="$SHARD_SEGMENTS"
+          export TERM_UNION_BENCH_MIN_SAMPLES="$MIN_SAMPLES"
+          export TERM_UNION_BENCH_BUDGET_SECS="$BUDGET_SECS"
+          export TERM_UNION_BENCH_INDEX_DIR="$RUNNER_TEMP/index"
           {
             echo "segments=$SHARD_SEGMENTS"
             echo "shard=$SHARD_FILTER"
@@ -157,11 +157,11 @@ jobs:
             echo "load_before=$(cut -d' ' -f1-3 /proc/loadavg)"
           } > "results/$shard.meta"
           # Build the index once. Both binaries open the same index.
-          BLOCK_WAND_BENCH_FILTER=no-cell dist/base
+          TERM_UNION_BENCH_FILTER=no-cell dist/base
           for rep in $(seq 1 "$REPETITIONS"); do
             if [ $((rep % 2)) -eq 1 ]; then order="base head"; else order="head base"; fi
             for side in $order; do
-              BLOCK_WAND_BENCH_FILTER="$SHARD_FILTER" "dist/$side" \
+              TERM_UNION_BENCH_FILTER="$SHARD_FILTER" "dist/$side" \
                 | awk -v seg="$SHARD_SEGMENTS" -v side="$side" -v rep="$rep" \
                     'NR > 1 { printf "%s\t%s\t%s", seg, side, rep; for (i = 1; i <= NF; i++) printf "\t%s", $i; print "" }' \
                 | tee -a "results/$shard.tsv"
@@ -199,11 +199,11 @@ jobs:
         run: |
           base=$(sed -n 's/^base=//p' dist/refs.txt)
           head=$(sed -n 's/^head=//p' dist/refs.txt)
-          header="## Block-Max WAND bench
+          header="## Term union bench
 
           Baseline \`${base:0:8}\`, head \`${head:0:8}\`. ${NUM_DOCS} documents, ${MIN_SAMPLES} minimum samples, ${REPETITIONS} runs of each binary per cell. [Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
           status=0
-          python3 .github/bench/summarize_block_wand_bench.py results --header "$header" --output summary.md || status=$?
+          python3 .github/bench/summarize_term_union_bench.py results --header "$header" --output summary.md || status=$?
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "status=$status" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
