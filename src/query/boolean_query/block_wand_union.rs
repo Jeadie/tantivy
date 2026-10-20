@@ -53,11 +53,11 @@ fn block_max_was_too_low_advance_one_scorer(scorers: &mut [TermScorerCursor], pi
     debug_assert!(is_sorted_by_doc(scorers));
     let mut scorer_to_seek = pivot_len - 1;
     let mut global_max_score = scorers[scorer_to_seek].max_score;
-    let mut doc_to_seek_after = scorers[scorer_to_seek].scorer.last_doc_in_block();
+    let mut doc_to_seek_after = scorers[scorer_to_seek].last_doc_in_block();
     for scorer_ord in (0..pivot_len - 1).rev() {
         let scorer = &scorers[scorer_ord];
-        if scorer.scorer.last_doc_in_block() <= doc_to_seek_after {
-            doc_to_seek_after = scorer.scorer.last_doc_in_block();
+        if scorer.last_doc_in_block() <= doc_to_seek_after {
+            doc_to_seek_after = scorer.last_doc_in_block();
         }
         if scorers[scorer_ord].max_score > global_max_score {
             global_max_score = scorers[scorer_ord].max_score;
@@ -190,10 +190,7 @@ pub fn block_wand(
 
         let block_max_score_upperbound: Score = scorers[..pivot_len]
             .iter_mut()
-            .map(|cursor| {
-                cursor.scorer.seek_block(pivot_doc);
-                cursor.scorer.block_max_score()
-            })
+            .map(|cursor| cursor.block_max_score(pivot_doc))
             .sum();
 
         // Beware after shallow advance, skip readers can be in advance compared to
@@ -292,7 +289,16 @@ pub fn block_wand_single_scorer(
 struct TermScorerCursor<'a> {
     doc: DocId,
     max_score: Score,
+    /// The block of the skip reader, when it is known and is not the last block.
+    block: Option<BlockBound>,
     scorer: &'a mut TermScorer,
+}
+
+/// The last doc and the block max score of a skip reader block.
+#[derive(Clone, Copy)]
+struct BlockBound {
+    last_doc: DocId,
+    max_score: Score,
 }
 
 impl<'a> From<&'a mut TermScorer> for TermScorerCursor<'a> {
@@ -300,6 +306,7 @@ impl<'a> From<&'a mut TermScorer> for TermScorerCursor<'a> {
         TermScorerCursor {
             doc: scorer.doc(),
             max_score: scorer.max_score(),
+            block: None,
             scorer,
         }
     }
@@ -308,12 +315,53 @@ impl<'a> From<&'a mut TermScorer> for TermScorerCursor<'a> {
 impl TermScorerCursor<'_> {
     fn seek(&mut self, target: DocId) -> DocId {
         self.doc = self.scorer.seek(target);
+        self.forget_block_if_passed();
         self.doc
     }
 
     fn advance(&mut self) -> DocId {
         self.doc = self.scorer.advance();
+        self.forget_block_if_passed();
         self.doc
+    }
+
+    /// The skip reader only moves to a later block when `seek` or `advance` goes past the last
+    /// doc of its current block. If the new doc is still within that block, the skip reader
+    /// did not move and `block` is still valid.
+    fn forget_block_if_passed(&mut self) {
+        if self.block.is_some_and(|block| self.doc > block.last_doc) {
+            self.block = None;
+        }
+    }
+
+    /// Same as `scorer.seek_block(target)` followed by `scorer.block_max_score()`. While
+    /// `target` is in the block of the previous call, the result comes from `block`.
+    fn block_max_score(&mut self, target: DocId) -> Score {
+        if let Some(block) = self.block {
+            if target <= block.last_doc {
+                debug_assert_eq!(self.scorer.last_doc_in_block(), block.last_doc);
+                debug_assert_eq!(self.scorer.block_max_score(), block.max_score);
+                return block.max_score;
+            }
+        }
+        self.scorer.seek_block(target);
+        let last_doc = self.scorer.last_doc_in_block();
+        let max_score = self.scorer.block_max_score();
+        // The block max score of the last block changes once that block is loaded, so it is
+        // not kept. The last block is the only one with `last_doc == TERMINATED`.
+        self.block = (last_doc != TERMINATED).then_some(BlockBound {
+            last_doc,
+            max_score,
+        });
+        max_score
+    }
+
+    /// The last doc of the skip reader block. Must be called after `block_max_score`, with no
+    /// `seek` or `advance` in between.
+    fn last_doc_in_block(&self) -> DocId {
+        let last_doc = self.block.map_or(TERMINATED, |block| block.last_doc);
+        debug_assert_eq!(last_doc, self.scorer.last_doc_in_block());
+        last_doc
     }
 
     fn is_in_sync(&self) -> bool {
