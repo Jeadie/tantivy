@@ -83,6 +83,14 @@ fn block_max_was_too_low_advance_one_scorer(scorers: &mut [TermScorerCursor], pi
 // except term_scorers[ord] that might be in advance compared to its ranks,
 // bubble up term_scorers[ord] in order to restore the ordering.
 fn restore_ordering(term_scorers: &mut [TermScorerCursor], ord: usize) {
+    move_right_to_sorted_position(term_scorers, ord);
+    debug_assert!(is_sorted_by_doc(term_scorers));
+}
+
+// Moves `term_scorers[ord]` to the right, past the scorers with a smaller doc.
+// `term_scorers[ord + 1..]` must be sorted. The scorer stays before scorers with an equal doc,
+// as a stable sort would keep it.
+fn move_right_to_sorted_position(term_scorers: &mut [TermScorerCursor], ord: usize) {
     let doc = term_scorers[ord].doc;
     for i in ord + 1..term_scorers.len() {
         if term_scorers[i].doc >= doc {
@@ -90,7 +98,6 @@ fn restore_ordering(term_scorers: &mut [TermScorerCursor], ord: usize) {
         }
         term_scorers.swap(i, i - 1);
     }
-    debug_assert!(is_sorted_by_doc(term_scorers));
 }
 
 // Attempts to advance all term_scorers between `&term_scorers[0..before_len]` to the pivot.
@@ -127,19 +134,34 @@ fn align_scorers(
 // Advance term_scorers[..pivot_len] and out of these removes the terminated scores.
 // Restores the ordering of term_scorers.
 fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerCursor>, pivot_len: usize) {
+    let mut has_terminated = false;
     for term_scorer in &mut term_scorers[..pivot_len] {
-        term_scorer.advance();
+        has_terminated |= term_scorer.advance() == TERMINATED;
     }
-    // TODO use drain_filter when available.
-    let mut i = 0;
-    while i != term_scorers.len() {
-        if term_scorers[i].doc == TERMINATED {
-            term_scorers.swap_remove(i);
-        } else {
-            i += 1;
+    // `term_scorers[pivot_len..]` is sorted, so a terminated scorer there is the last one.
+    has_terminated |= term_scorers
+        .last()
+        .is_some_and(|term_scorer| term_scorer.doc == TERMINATED);
+    if has_terminated {
+        // TODO use drain_filter when available.
+        let mut i = 0;
+        while i != term_scorers.len() {
+            if term_scorers[i].doc == TERMINATED {
+                term_scorers.swap_remove(i);
+            } else {
+                i += 1;
+            }
         }
+        term_scorers.sort_by_key(|scorer| scorer.doc);
+        return;
     }
-    term_scorers.sort_by_key(|scorer| scorer.doc);
+    // Only `term_scorers[..pivot_len]` moved, and `term_scorers[pivot_len..]` is still sorted.
+    // Insert the moved scorers from right to left. This gives the same order as a stable sort
+    // of the whole slice, so the score of a doc is summed in the same order.
+    for ord in (0..pivot_len).rev() {
+        move_right_to_sorted_position(term_scorers, ord);
+    }
+    debug_assert!(is_sorted_by_doc(term_scorers));
 }
 
 /// Implements the WAND (Weak AND) algorithm for dynamic pruning
