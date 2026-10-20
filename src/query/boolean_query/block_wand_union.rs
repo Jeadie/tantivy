@@ -1,5 +1,3 @@
-use std::ops::{Deref, DerefMut};
-
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 use crate::{DocId, DocSet, Score, TERMINATED};
@@ -14,7 +12,7 @@ use crate::{DocId, DocSet, Score, TERMINATED};
 ///
 /// `None` is returned if we establish that no document can exceed the threshold.
 fn find_pivot_doc(
-    term_scorers: &[TermScorerWithMaxScore],
+    term_scorers: &[TermScorerCursor],
     threshold: Score,
 ) -> Option<(usize, usize, DocId)> {
     let mut max_score = 0.0;
@@ -24,7 +22,7 @@ fn find_pivot_doc(
         let term_scorer = &term_scorers[before_pivot_len];
         max_score += term_scorer.max_score;
         if max_score > threshold {
-            pivot_doc = term_scorer.doc();
+            pivot_doc = term_scorer.doc;
             break;
         }
         before_pivot_len += 1;
@@ -37,27 +35,29 @@ fn find_pivot_doc(
     // Some other term_scorer may be positioned on the same document.
     pivot_len += term_scorers[pivot_len..]
         .iter()
-        .take_while(|term_scorer| term_scorer.doc() == pivot_doc)
+        .take_while(|term_scorer| term_scorer.doc == pivot_doc)
         .count();
     Some((before_pivot_len, pivot_len, pivot_doc))
+}
+
+fn is_sorted_by_doc(term_scorers: &[TermScorerCursor]) -> bool {
+    term_scorers.iter().all(|cursor| cursor.is_in_sync())
+        && term_scorers.iter().map(|cursor| cursor.doc).is_sorted()
 }
 
 /// Advance the scorer with best score among the scorers[..pivot_len] to
 /// the next doc candidate defined by the min of `last_doc_in_block + 1` for
 /// scorer in scorers[..pivot_len] and `scorer.doc()` for scorer in scorers[pivot_len..].
 /// Note: before and after calling this method, scorers need to be sorted by their `.doc()`.
-fn block_max_was_too_low_advance_one_scorer(
-    scorers: &mut [TermScorerWithMaxScore],
-    pivot_len: usize,
-) {
-    debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
+fn block_max_was_too_low_advance_one_scorer(scorers: &mut [TermScorerCursor], pivot_len: usize) {
+    debug_assert!(is_sorted_by_doc(scorers));
     let mut scorer_to_seek = pivot_len - 1;
     let mut global_max_score = scorers[scorer_to_seek].max_score;
-    let mut doc_to_seek_after = scorers[scorer_to_seek].last_doc_in_block();
+    let mut doc_to_seek_after = scorers[scorer_to_seek].scorer.last_doc_in_block();
     for scorer_ord in (0..pivot_len - 1).rev() {
         let scorer = &scorers[scorer_ord];
-        if scorer.last_doc_in_block() <= doc_to_seek_after {
-            doc_to_seek_after = scorer.last_doc_in_block();
+        if scorer.scorer.last_doc_in_block() <= doc_to_seek_after {
+            doc_to_seek_after = scorer.scorer.last_doc_in_block();
         }
         if scorers[scorer_ord].max_score > global_max_score {
             global_max_score = scorers[scorer_ord].max_score;
@@ -69,28 +69,28 @@ fn block_max_was_too_low_advance_one_scorer(
         doc_to_seek_after += 1;
     }
     for scorer in &scorers[pivot_len..] {
-        if scorer.doc() <= doc_to_seek_after {
-            doc_to_seek_after = scorer.doc();
+        if scorer.doc <= doc_to_seek_after {
+            doc_to_seek_after = scorer.doc;
         }
     }
     scorers[scorer_to_seek].seek(doc_to_seek_after);
 
     restore_ordering(scorers, scorer_to_seek);
-    debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
+    debug_assert!(is_sorted_by_doc(scorers));
 }
 
 // Given a list of term_scorers and a `ord` and assuming that `term_scorers[ord]` is sorted
 // except term_scorers[ord] that might be in advance compared to its ranks,
 // bubble up term_scorers[ord] in order to restore the ordering.
-fn restore_ordering(term_scorers: &mut [TermScorerWithMaxScore], ord: usize) {
-    let doc = term_scorers[ord].doc();
+fn restore_ordering(term_scorers: &mut [TermScorerCursor], ord: usize) {
+    let doc = term_scorers[ord].doc;
     for i in ord + 1..term_scorers.len() {
-        if term_scorers[i].doc() >= doc {
+        if term_scorers[i].doc >= doc {
             break;
         }
         term_scorers.swap(i, i - 1);
     }
-    debug_assert!(term_scorers.iter().map(|scorer| scorer.doc()).is_sorted());
+    debug_assert!(is_sorted_by_doc(term_scorers));
 }
 
 // Attempts to advance all term_scorers between `&term_scorers[0..before_len]` to the pivot.
@@ -99,7 +99,7 @@ fn restore_ordering(term_scorers: &mut [TermScorerWithMaxScore], ord: usize) {
 // pivot), reorder the term_scorers to ensure the list is still sorted and returns `false`.
 // If a term_scorer reach TERMINATED in the process return false remove the term_scorer and return.
 fn align_scorers(
-    term_scorers: &mut Vec<TermScorerWithMaxScore>,
+    term_scorers: &mut Vec<TermScorerCursor>,
     pivot_doc: DocId,
     before_pivot_len: usize,
 ) -> bool {
@@ -126,20 +126,20 @@ fn align_scorers(
 // Assumes terms_scorers[..pivot_len] are positioned on the same doc (pivot_doc).
 // Advance term_scorers[..pivot_len] and out of these removes the terminated scores.
 // Restores the ordering of term_scorers.
-fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerWithMaxScore>, pivot_len: usize) {
+fn advance_all_scorers_on_pivot(term_scorers: &mut Vec<TermScorerCursor>, pivot_len: usize) {
     for term_scorer in &mut term_scorers[..pivot_len] {
         term_scorer.advance();
     }
     // TODO use drain_filter when available.
     let mut i = 0;
     while i != term_scorers.len() {
-        if term_scorers[i].doc() == TERMINATED {
+        if term_scorers[i].doc == TERMINATED {
             term_scorers.swap_remove(i);
         } else {
             i += 1;
         }
     }
-    term_scorers.sort_by_key(|scorer| scorer.doc());
+    term_scorers.sort_by_key(|scorer| scorer.doc);
 }
 
 /// Implements the WAND (Weak AND) algorithm for dynamic pruning
@@ -155,24 +155,22 @@ pub fn block_wand(
         let scorer = scorers.pop().unwrap();
         return block_wand_single_scorer(scorer, threshold, callback);
     }
-    let mut scorers: Vec<TermScorerWithMaxScore> = scorers
-        .iter_mut()
-        .map(TermScorerWithMaxScore::from)
-        .collect();
+    let mut scorers: Vec<TermScorerCursor> =
+        scorers.iter_mut().map(TermScorerCursor::from).collect();
     // At this point we need to ensure that the scorers are sorted!
-    scorers.sort_by_key(|scorer| scorer.doc());
+    scorers.sort_by_key(|scorer| scorer.doc);
     while let Some((before_pivot_len, pivot_len, pivot_doc)) =
         find_pivot_doc(&scorers[..], threshold)
     {
-        debug_assert!(scorers.iter().map(|scorer| scorer.doc()).is_sorted());
+        debug_assert!(is_sorted_by_doc(&scorers));
         debug_assert_ne!(pivot_doc, TERMINATED);
         debug_assert!(before_pivot_len < pivot_len);
 
         let block_max_score_upperbound: Score = scorers[..pivot_len]
             .iter_mut()
-            .map(|scorer| {
-                scorer.seek_block(pivot_doc);
-                scorer.block_max_score()
+            .map(|cursor| {
+                cursor.scorer.seek_block(pivot_doc);
+                cursor.scorer.block_max_score()
             })
             .sum();
 
@@ -204,7 +202,7 @@ pub fn block_wand(
         // At this point, all scorers are positioned on the doc.
         let score = scorers[..pivot_len]
             .iter_mut()
-            .map(|scorer| scorer.score())
+            .map(|cursor| cursor.scorer.score())
             .sum();
 
         if score > threshold {
@@ -264,29 +262,40 @@ pub fn block_wand_single_scorer(
     }
 }
 
-struct TermScorerWithMaxScore<'a> {
-    scorer: &'a mut TermScorer,
+/// A term scorer with copies of its current doc and term-wide max score.
+///
+/// The copies sit next to each other in the `Vec` that `block_wand` keeps sorted, so the
+/// sorting, pivot search and alignment read contiguous memory instead of the postings.
+/// `doc` must be updated after every call that moves `scorer`: use `seek` and `advance`.
+struct TermScorerCursor<'a> {
+    doc: DocId,
     max_score: Score,
+    scorer: &'a mut TermScorer,
 }
 
-impl<'a> From<&'a mut TermScorer> for TermScorerWithMaxScore<'a> {
+impl<'a> From<&'a mut TermScorer> for TermScorerCursor<'a> {
     fn from(scorer: &'a mut TermScorer) -> Self {
-        let max_score = scorer.max_score();
-        TermScorerWithMaxScore { scorer, max_score }
+        TermScorerCursor {
+            doc: scorer.doc(),
+            max_score: scorer.max_score(),
+            scorer,
+        }
     }
 }
 
-impl Deref for TermScorerWithMaxScore<'_> {
-    type Target = TermScorer;
-
-    fn deref(&self) -> &Self::Target {
-        self.scorer
+impl TermScorerCursor<'_> {
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.doc = self.scorer.seek(target);
+        self.doc
     }
-}
 
-impl DerefMut for TermScorerWithMaxScore<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.scorer
+    fn advance(&mut self) -> DocId {
+        self.doc = self.scorer.advance();
+        self.doc
+    }
+
+    fn is_in_sync(&self) -> bool {
+        self.doc == self.scorer.doc()
     }
 }
 
