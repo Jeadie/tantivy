@@ -1,4 +1,4 @@
-"""Summarizes `block_wand_union_bench` A/B results from the `Block-Max WAND bench` workflow.
+"""Summarizes `term_union_bench` A/B results from the `Term union bench` workflow.
 
 Input: a directory of `*.tsv` result files and `*.meta` files written by the bench jobs.
 Output: a Markdown report. The exit code is 1 if the baseline and the head return different
@@ -292,7 +292,7 @@ def report(by_segments: dict[int, list[Cell]], metas: list[JobMeta], header: str
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("results_dir", type=Path)
-    parser.add_argument("--header", default="## Block-Max WAND bench")
+    parser.add_argument("--header", default="## Term union bench")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 

@@ -1,9 +1,9 @@
-"""Compares the results of two runs of the `Block-Max WAND bench` workflow.
+"""Compares the results of two runs of the `Term union bench` workflow.
 
 Example: compare the head of run 222 with the head of run 111 (for example, `main` at two dates,
 or two branches that each ran against `main`):
 
-    python3 .github/bench/compare_block_wand_runs.py 111 222 --repo Jeadie/tantivy
+    python3 .github/bench/compare_term_union_runs.py 111 222 --repo Jeadie/tantivy
 
 The script downloads the `summary` artifact of each run with the GitHub CLI (`gh`), and compares
 one side (`head` by default) of each run, cell by cell. Use `--dir-a` / `--dir-b` instead of run
@@ -28,7 +28,7 @@ from pathlib import Path
 # Do not write __pycache__ next to the scripts when importing the summary module.
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from summarize_block_wand_bench import (  # noqa: E402
+from summarize_term_union_bench import (  # noqa: E402
     PERCENTILES,
     JobMeta,
     Percentile,
@@ -143,7 +143,7 @@ def report(run_a: RunResults, run_b: RunResults, side: str, comparisons: list[Ce
         return ", ".join(sha[:8] for sha in sorted(run.shas(side))) or "unknown"
 
     lines = [
-        "## Block-Max WAND bench: comparison of two runs",
+        "## Term union bench: comparison of two runs",
         "",
         f"Side: `{side}`. Run A: {run_a.label} ({shas(run_a)}). Run B: {run_b.label} ({shas(run_b)}).",
         "Change = median of run B / median of run A - 1, for each percentile. Cells measured on",
