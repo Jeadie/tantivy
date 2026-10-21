@@ -56,8 +56,8 @@ class RunResults:
                 return meta
         return None
 
-    def settings(self) -> set[tuple[str, str]]:
-        return {(meta.num_docs, meta.min_samples) for meta in self.metas}
+    def settings(self) -> set[tuple[str, str, str]]:
+        return {(meta.num_docs, meta.min_samples, meta.queries) for meta in self.metas}
 
     def shas(self, side: str) -> set[str]:
         return {meta.head_sha if side == "head" else meta.base_sha for meta in self.metas} - {""}
@@ -186,7 +186,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-different-settings",
         action="store_true",
-        help="Compare runs that used a different number of documents or minimum samples",
+        help="Compare runs that used a different number of documents, minimum samples or queries",
     )
     args = parser.parse_args()
     if not (args.run_a or args.dir_a) or not (args.run_b or args.dir_b):
@@ -202,12 +202,13 @@ def main() -> int:
         if not run.measurements:
             print(f"{run.label}: no results were found", file=sys.stderr)
             return 1
-        if run.settings() == {("", "")}:
+        if run.settings() == {("", "", "")}:
             print(f"{run.label}: the settings were not recorded (older workflow)", file=sys.stderr)
-    settings_a, settings_b = run_a.settings() - {("", "")}, run_b.settings() - {("", "")}
+    unknown = {("", "", "")}
+    settings_a, settings_b = run_a.settings() - unknown, run_b.settings() - unknown
     if settings_a and settings_b and settings_a != settings_b and not args.allow_different_settings:
         print(
-            f"The runs used different settings (documents, minimum samples): {sorted(settings_a)} "
+            f"The runs used different settings (documents, minimum samples, queries): {sorted(settings_a)} "
             f"and {sorted(settings_b)}. Use --allow-different-settings to compare them.",
             file=sys.stderr,
         )

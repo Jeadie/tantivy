@@ -39,6 +39,9 @@ on:
       budget_secs:
         description: Time per cell and run after the minimum sample count
         default: "10"
+      queries:
+        description: Distinct queries per cell. The samples go through them in turn.
+        default: "100"
       repetitions:
         description: Runs of each binary per cell, in alternating order (3 = A B, B A, A B)
         default: "3"
@@ -62,6 +65,7 @@ env:
   TERMS: ${{ inputs.terms || '[2, 3, 5, 10, 20]' }}
   MIN_SAMPLES: ${{ inputs.min_samples || '1000' }}
   BUDGET_SECS: ${{ inputs.budget_secs || '10' }}
+  QUERIES: ${{ inputs.queries || '100' }}
   REPETITIONS: ${{ inputs.repetitions || '3' }}
 
 jobs:
@@ -144,12 +148,14 @@ jobs:
           export TERM_UNION_BENCH_SEGMENTS="$SHARD_SEGMENTS"
           export TERM_UNION_BENCH_MIN_SAMPLES="$MIN_SAMPLES"
           export TERM_UNION_BENCH_BUDGET_SECS="$BUDGET_SECS"
+          export TERM_UNION_BENCH_QUERIES="$QUERIES"
           export TERM_UNION_BENCH_INDEX_DIR="$RUNNER_TEMP/index"
           {
             echo "segments=$SHARD_SEGMENTS"
             echo "shard=$SHARD_FILTER"
             echo "num_docs=$NUM_DOCS"
             echo "min_samples=$MIN_SAMPLES"
+            echo "queries=$QUERIES"
             echo "budget_secs=$BUDGET_SECS"
             echo "repetitions=$REPETITIONS"
             cat dist/refs.txt
@@ -201,7 +207,7 @@ jobs:
           head=$(sed -n 's/^head=//p' dist/refs.txt)
           header="## Term union bench
 
-          Baseline \`${base:0:8}\`, head \`${head:0:8}\`. ${NUM_DOCS} documents, ${MIN_SAMPLES} minimum samples, ${REPETITIONS} runs of each binary per cell. [Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+          Baseline \`${base:0:8}\`, head \`${head:0:8}\`. ${NUM_DOCS} documents, ${QUERIES} distinct queries per cell, ${MIN_SAMPLES} minimum samples, ${REPETITIONS} runs of each binary per cell. [Workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
           status=0
           python3 .github/bench/summarize_term_union_bench.py results --header "$header" --output summary.md || status=$?
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
