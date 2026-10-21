@@ -3,16 +3,20 @@
 // What's measured:
 // - `a OR b OR ...` term unions (`BooleanQuery::new_multiterms_query`), top-K by BM25 score.
 // - Matrix: query mix x number of terms (2, 3, 5, 10, 20) x K (10, 100, 1000).
-// - P99 and P99.9 latency per cell. binggan only reports min/median/average/max, so this bench
-//   collects its own samples.
+// - Each cell times many distinct queries of its shape, drawn from the vocabulary with a seed that
+//   depends on the cell. The samples go through the queries in turn, so the percentiles describe
+//   the query mix of the cell, not only the timing noise of one query.
+// - P90, P95, P99 and P99.9 latency per cell. binggan only reports min/median/average/max, so this
+//   bench collects its own samples.
 //
-// Corpus model (seeded RNG; 1M docs in one segment by default):
-// - 20 terms in each of four classes: rare (0.1% of docs), medium (3%), dense (25%), and correlated
-//   (50% of the 5% "topic" docs, 0.5% of the others).
+// Corpus model (seeded RNG; 1M docs in one segment by default). Each class has a document
+// frequency per term, with a fixed spread of 0.5x to 2x between the terms of the class:
+// - rare: 200 terms, 0.1% of docs; medium: 100 terms, 3%; dense: 40 terms, 25%;
+// - correlated: 100 terms, in 10% of the 5% "topic" docs and 0.1% of the other docs.
 // - Term frequencies follow a geometric-like distribution; filler tokens vary field lengths.
 //
-// Each cell also prints a checksum of the top-K (doc address, score bits), so that two builds
-// can be checked for identical results.
+// Each cell also prints a checksum of the top-K (doc address, score bits) of all its queries, so
+// that two builds can be checked for identical results.
 //
 // Run with: cargo bench --bench term_union_bench
 // Environment variables:
@@ -25,6 +29,7 @@
 //   segment collects its own top K from a threshold of zero, as in production searches.
 // - TERM_UNION_BENCH_MIN_SAMPLES / TERM_UNION_BENCH_MAX_SAMPLES: samples per cell (default 1,000
 //   and 10,000). P99 needs at least 1,000 samples to have 10 samples above it, P99.9 needs 10,000.
+// - TERM_UNION_BENCH_QUERIES: distinct queries per cell (default 100).
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -40,7 +45,9 @@ use tantivy::schema::{Field, Schema, TEXT};
 use tantivy::{doc, Index, ReloadPolicy, Searcher, Term};
 
 const DEFAULT_NUM_DOCS: usize = 1_000_000;
-const TERMS_PER_CLASS: usize = 20;
+const DEFAULT_NUM_QUERIES: usize = 100;
+/// Changes when the corpus model changes, so that an index directory of an older model is refused.
+const CORPUS_VERSION: u32 = 2;
 const NUM_TERMS: [usize; 5] = [2, 3, 5, 10, 20];
 const TOP_K: [usize; 3] = [10, 100, 1000];
 
@@ -67,6 +74,7 @@ struct BenchConfig {
     num_segments: usize,
     min_samples: usize,
     max_samples: usize,
+    num_queries: usize,
 }
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -90,15 +98,20 @@ impl BenchConfig {
             num_segments: env_or("TERM_UNION_BENCH_SEGMENTS", 1),
             min_samples: env_or("TERM_UNION_BENCH_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
             max_samples: env_or("TERM_UNION_BENCH_MAX_SAMPLES", DEFAULT_MAX_SAMPLES),
+            num_queries: env_or("TERM_UNION_BENCH_QUERIES", DEFAULT_NUM_QUERIES),
         };
         assert!(config.num_segments >= 1 && config.num_segments <= config.num_docs);
         assert!(config.min_samples >= 1 && config.min_samples <= config.max_samples);
+        assert!(config.num_queries >= 1);
         config
     }
 
     /// Identifies the corpus, so that an index directory is only reused for the same corpus.
     fn corpus_id(&self) -> String {
-        format!("docs={} segments={}", self.num_docs, self.num_segments)
+        format!(
+            "version={CORPUS_VERSION} docs={} segments={}",
+            self.num_docs, self.num_segments
+        )
     }
 }
 
@@ -129,6 +142,45 @@ impl TermClass {
 
     fn token(self, ord: usize) -> String {
         format!("{}{ord}", self.prefix())
+    }
+
+    /// Number of terms of the class. There are enough terms to draw many distinct queries of
+    /// 20 terms, and few enough dense terms to keep documents short.
+    fn vocabulary_size(self) -> usize {
+        match self {
+            TermClass::Rare => 200,
+            TermClass::Medium => 100,
+            TermClass::Dense => 40,
+            TermClass::Correlated => 100,
+        }
+    }
+
+    /// Probability that a document contains a given term of the class, before the per-term
+    /// spread.
+    fn base_probability(self, is_topic_doc: bool) -> f64 {
+        match self {
+            TermClass::Rare => 0.001,
+            TermClass::Medium => 0.03,
+            TermClass::Dense => 0.25,
+            TermClass::Correlated if is_topic_doc => 0.1,
+            TermClass::Correlated => 0.001,
+        }
+    }
+
+    /// Per-term factors between 0.5 and 2 that spread the document frequencies inside the class.
+    fn term_spread(self) -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(self as u64 + 1);
+        (0..self.vocabulary_size())
+            .map(|_| 2f64.powf(rng.random_range(-1.0..=1.0)))
+            .collect()
+    }
+
+    /// Draws `count` distinct terms of the class.
+    fn sample_tokens(self, count: usize, rng: &mut StdRng) -> Vec<String> {
+        rand::seq::index::sample(rng, self.vocabulary_size(), count)
+            .into_iter()
+            .map(|ord| self.token(ord))
+            .collect()
     }
 }
 
@@ -166,23 +218,44 @@ impl QueryMix {
         }
     }
 
-    fn tokens(self, num_terms: usize) -> Vec<String> {
-        let single_class = |class: TermClass| (0..num_terms).map(|ord| class.token(ord)).collect();
+    /// Draws the tokens of one query with `num_terms` distinct terms.
+    fn sample_query_tokens(self, num_terms: usize, rng: &mut StdRng) -> Vec<String> {
         match self {
-            QueryMix::Rare => single_class(TermClass::Rare),
-            QueryMix::Medium => single_class(TermClass::Medium),
-            QueryMix::Dense => single_class(TermClass::Dense),
-            QueryMix::Correlated => single_class(TermClass::Correlated),
-            QueryMix::Skewed => std::iter::once(TermClass::Dense.token(0))
-                .chain((0..num_terms - 1).map(|ord| TermClass::Rare.token(ord)))
-                .collect(),
-            QueryMix::Mixed => (0..num_terms)
-                .map(|ord| {
-                    let class = [TermClass::Rare, TermClass::Medium, TermClass::Dense][ord % 3];
-                    class.token(ord / 3)
-                })
-                .collect(),
+            QueryMix::Rare => TermClass::Rare.sample_tokens(num_terms, rng),
+            QueryMix::Medium => TermClass::Medium.sample_tokens(num_terms, rng),
+            QueryMix::Dense => TermClass::Dense.sample_tokens(num_terms, rng),
+            QueryMix::Correlated => TermClass::Correlated.sample_tokens(num_terms, rng),
+            QueryMix::Skewed => {
+                let mut tokens = TermClass::Dense.sample_tokens(1, rng);
+                tokens.extend(TermClass::Rare.sample_tokens(num_terms - 1, rng));
+                tokens
+            }
+            // The same class counts as cycling through rare, medium and dense.
+            QueryMix::Mixed => {
+                let mut tokens = TermClass::Rare.sample_tokens(num_terms.div_ceil(3), rng);
+                tokens.extend(TermClass::Medium.sample_tokens((num_terms + 1) / 3, rng));
+                tokens.extend(TermClass::Dense.sample_tokens(num_terms / 3, rng));
+                tokens
+            }
         }
+    }
+
+    /// The distinct queries of a cell. They depend only on the mix, the number of terms and the
+    /// number of queries, so every binary and every K of the cell uses the same queries.
+    fn queries(self, num_terms: usize, num_queries: usize, body: Field) -> Vec<BooleanQuery> {
+        let mut hasher = DefaultHasher::new();
+        (self.name(), num_terms).hash(&mut hasher);
+        let mut rng = StdRng::seed_from_u64(hasher.finish());
+        (0..num_queries)
+            .map(|_| {
+                let terms: Vec<Term> = self
+                    .sample_query_tokens(num_terms, &mut rng)
+                    .iter()
+                    .map(|token| Term::from_field_text(body, token))
+                    .collect();
+                BooleanQuery::new_multiterms_query(terms)
+            })
+            .collect()
     }
 }
 
@@ -200,7 +273,15 @@ fn fill_index(index: &Index, body: Field, config: &BenchConfig) {
     let mut rng = StdRng::from_seed([7u8; 32]);
     let tokens: Vec<Vec<String>> = TermClass::ALL
         .iter()
-        .map(|class| (0..TERMS_PER_CLASS).map(|ord| class.token(ord)).collect())
+        .map(|class| {
+            (0..class.vocabulary_size())
+                .map(|ord| class.token(ord))
+                .collect()
+        })
+        .collect();
+    let spreads: Vec<Vec<f64>> = TermClass::ALL
+        .iter()
+        .map(|class| class.term_spread())
         .collect();
     let mut writer = index.writer_with_num_threads(1, 2_000_000_000).unwrap();
     writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -212,16 +293,10 @@ fn fill_index(index: &Index, body: Field, config: &BenchConfig) {
         }
         text.clear();
         let is_topic_doc = rng.random_bool(0.05);
-        for (class, class_tokens) in TermClass::ALL.iter().zip(&tokens) {
-            let probability = match class {
-                TermClass::Rare => 0.001,
-                TermClass::Medium => 0.03,
-                TermClass::Dense => 0.25,
-                TermClass::Correlated if is_topic_doc => 0.5,
-                TermClass::Correlated => 0.005,
-            };
-            for token in class_tokens {
-                if rng.random_bool(probability) {
+        for ((class, class_tokens), spread) in TermClass::ALL.iter().zip(&tokens).zip(&spreads) {
+            let probability = class.base_probability(is_topic_doc);
+            for (token, factor) in class_tokens.iter().zip(spread) {
+                if rng.random_bool(probability * factor) {
                     for _ in 0..random_term_freq(&mut rng) {
                         text.push_str(token);
                         text.push(' ');
@@ -323,6 +398,15 @@ fn checksum(hits: &[(f32, tantivy::DocAddress)]) -> u64 {
     hasher.finish()
 }
 
+/// Combines the checksums of the queries of a cell, in order.
+fn combine_checksums(checksums: impl Iterator<Item = u64>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for checksum in checksums {
+        checksum.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn main() {
     let config = BenchConfig::from_env();
     let build_start = Instant::now();
@@ -334,15 +418,23 @@ fn main() {
         build_start.elapsed().as_secs_f64()
     );
     for class in TermClass::ALL {
-        let doc_freq = searcher
-            .doc_freq(&Term::from_field_text(body, &class.token(0)))
-            .unwrap();
+        let doc_freqs: Vec<u64> = (0..class.vocabulary_size())
+            .map(|ord| {
+                searcher
+                    .doc_freq(&Term::from_field_text(body, &class.token(ord)))
+                    .unwrap()
+            })
+            .collect();
+        let percent = |doc_freq: u64| 100.0 * doc_freq as f64 / config.num_docs as f64;
         eprintln!(
-            "{:>7} terms: doc_freq ~ {doc_freq} ({:.2}%)",
+            "{:>7}: {} terms, doc_freq {:.2}% to {:.2}%",
             class.prefix(),
-            100.0 * doc_freq as f64 / config.num_docs as f64
+            doc_freqs.len(),
+            percent(*doc_freqs.iter().min().unwrap()),
+            percent(*doc_freqs.iter().max().unwrap()),
         );
     }
+    eprintln!("{} distinct queries per cell", config.num_queries);
 
     let percentile_names: Vec<String> = PERCENTILES
         .iter()
@@ -359,20 +451,21 @@ fn main() {
     );
     for mix in QueryMix::ALL {
         for num_terms in NUM_TERMS {
-            let terms: Vec<Term> = mix
-                .tokens(num_terms)
-                .iter()
-                .map(|token| Term::from_field_text(body, token))
-                .collect();
-            let query = BooleanQuery::new_multiterms_query(terms);
+            let queries = mix.queries(num_terms, config.num_queries, body);
             for k in TOP_K {
                 let label = format!("{}/{num_terms}/{k}", mix.name());
                 if !label.contains(&config.filter) {
                     continue;
                 }
-                let result_checksum = checksum(&search(&searcher, &query, k));
-                for _ in 0..WARMUP_RUNS {
-                    std::hint::black_box(search(&searcher, &query, k));
+                // This also runs every query once before the timed samples.
+                let result_checksum = combine_checksums(
+                    queries
+                        .iter()
+                        .map(|query| checksum(&search(&searcher, query, k))),
+                );
+                for warmup in 0..WARMUP_RUNS {
+                    let query = &queries[warmup % queries.len()];
+                    std::hint::black_box(search(&searcher, query, k));
                 }
                 let mut samples: Vec<Duration> = Vec::with_capacity(config.max_samples);
                 let cell_start = Instant::now();
@@ -380,8 +473,9 @@ fn main() {
                     && (samples.len() < config.min_samples
                         || cell_start.elapsed() < config.cell_budget)
                 {
+                    let query = &queries[samples.len() % queries.len()];
                     let start = Instant::now();
-                    std::hint::black_box(search(&searcher, &query, k));
+                    std::hint::black_box(search(&searcher, query, k));
                     samples.push(start.elapsed());
                 }
                 samples.sort();
